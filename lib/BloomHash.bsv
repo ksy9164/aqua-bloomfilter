@@ -6,7 +6,7 @@ import Vector::*;
 
 interface BloomHashIfc;
     method Action enq(Bit#(64) d);
-    method ActionValue#(Bit#(64)) get;
+    method ActionValue#(Bit#(32)) get;
 endinterface
 
 function Bit#(32) jshash (Bit#(32) hash, Bit#(8) d);
@@ -424,4 +424,5 @@ module mkRotatingHash (BloomHashIfc);
         return outQ.first;
     endmethod
 endmodule
+
 endpackage

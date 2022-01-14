@@ -17,20 +17,18 @@ endinterface
 
 module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram) 
     (HwMainIfc);
-    Reg#(Bit#(32)) file_size <- mkReg(0);
+    Reg#(Bit#(32)) file_size <- mkReg(2550000);
     Reg#(Bit#(32)) dramWriteCnt <- mkReg(0);
     Reg#(Bit#(32)) dramReadCnt <- mkReg(0);
-    FIFOLI#(Tuple2#(Bit#(20), Bit#(32)), 2) pcie_reqQ <- mkFIFOLI;
+    FIFOLI#(Tuple2#(Bit#(20), Bit#(32)), 3) pcie_reqQ <- mkFIFOLI;
 
-    SerializerIfc#(128, 4) serial_pcieio <- mkSerializer;
-    SerializerIfc#(128, 16) serial_input <- mkSerializer;
     DeSerializerIfc#(128, 4) deserial_dram <- mkDeSerializer;
     SerializerIfc#(512, 4) serial_dramQ <- mkSerializer;
 
-    FIFO#(Bit#(32)) dmaReadReqQ <- mkFIFO;
-    FIFO#(Bit#(32)) dmaWriteReqQ <- mkFIFO;
-    FIFO#(Bit#(1)) dramWriteDoneSignalQ <- mkFIFO;
-    FIFO#(Bit#(1)) dmaWriteDoneSignalQ <- mkFIFO;
+    FIFOLI#(Bit#(32), 2) dmaReadReqQ <- mkFIFOLI;
+    FIFOLI#(Bit#(32), 2) dmaWriteReqQ <- mkFIFOLI;
+    FIFOLI#(Bit#(1), 2) dramWriteDoneSignalQ <- mkFIFOLI;
+    FIFOLI#(Bit#(1), 2) dmaWriteDoneSignalQ <- mkFIFOLI;
 
     Reg#(Bit#(32)) readCnt <- mkReg(0);
 
@@ -38,22 +36,40 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     Reg#(Bit#(32)) dmaWriteTarget <- mkReg(0);
     Reg#(Bit#(32)) dmaWriteCnt <- mkReg(0);
 
-    FIFO#(Bit#(2)) encodedDataQ <- mkFIFO;
     FIFO#(Bit#(64)) kmerQ <- mkFIFO;
     Reg#(Bit#(64)) kmer64bits <- mkReg(0);
     Reg#(Bit#(6)) kmerCnt <- mkReg(0);
 
-    MultiOneToFourIfc#(Bit#(64)) toHashMultiQ <- mkMultiOnetoFour;
+    Vector#(2 , MultiOneToEightIfc#(Bit#(64))) toHashMultiQ <- replicateM(mkMultiOnetoEight);
 
-    Vector#(4, BloomHashIfc) hashfuncQ;
-    hashfuncQ[0] <- mkJshash;
-    hashfuncQ[1] <- mkElfhash;
-    hashfuncQ[2] <- mkSdbmhash;
-    hashfuncQ[3] <- mkDjbhash;
+    Vector#(2, Vector#(8, BloomHashIfc)) hashfuncQ <- replicateM(replicateM(mkJsHash));
 
-    Vector#(4, FIFOF#(Bit#(32))) merge_st1Q <- replicateM(mkFIFOF);
-    Vector#(2, FIFOF#(Bit#(64))) merge_st2Q <- replicateM(mkFIFOF);
-    Vector#(2, FIFOF#(Bit#(64))) hashedMergeDataQ <- replicateM(mkFIFOF);
+    FIFOLI#(Tuple2#(PcieCtrl::IOReadReq, Bit#(1)), 2) pcie_write_doneQ <- mkFIFOLI;
+
+    hashfuncQ[0][0] <- mkJsHash;
+    hashfuncQ[0][1] <- mkAddictiveHash;
+    hashfuncQ[0][2] <- mkSdbmHash;
+    hashfuncQ[0][3] <- mkDjbHash;
+    hashfuncQ[0][4] <- mkBernsteinHash;
+    hashfuncQ[0][5] <- mkBkdrHash;
+    hashfuncQ[0][6] <- mkDekHash;
+    hashfuncQ[0][7] <- mkRotatingHash;
+
+    hashfuncQ[1][0] <- mkJsHash;
+    hashfuncQ[1][1] <- mkAddictiveHash;
+    hashfuncQ[1][2] <- mkSdbmHash;
+    hashfuncQ[1][3] <- mkDjbHash;
+    hashfuncQ[1][4] <- mkBernsteinHash;
+    hashfuncQ[1][5] <- mkBkdrHash;
+    hashfuncQ[1][6] <- mkDekHash;
+    hashfuncQ[1][7] <- mkRotatingHash;
+
+    Vector#(2, FIFOLI#(Bit#(64), 3)) spread_inputQ <- replicateM(mkFIFOLI);
+
+    Vector#(8, FIFO#(Bit#(64))) merge_st1Q <- replicateM(mkFIFO);
+    Vector#(4, FIFO#(Bit#(128))) merge_st2Q <- replicateM(mkFIFO);
+    Vector#(2, FIFO#(Bit#(256))) merge_st3Q <- replicateM(mkFIFO);
+    FIFO#(Bit#(512)) toDramQ <- mkFIFO;
 
     Vector#(2, Reg#(Bit#(64))) merge_buf_1 <- replicateM(mkReg(0)); 
     Vector#(2, Reg#(Bit#(1))) merge_buf_1_ctl <- replicateM(mkReg(0)); 
@@ -75,9 +91,7 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         Bit#(32) d = tpl_2(pcie_reqQ.first);
 
         let off = (a>>2);
-        if ( off == 0 ) begin
-            file_size <= d;
-        end else if (off == 1) begin // Log Data In
+        if (off == 1) begin // Log Data In
             dmaReadReqQ.enq(d);
         end else if (off == 2) begin
             dmaWriteReqQ.enq(d);
@@ -99,139 +113,78 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
             dmaWriteDoneSignalQ.enq(1);
         end
         readCnt <= readCnt - 1;
-        serial_input.put(rd);
+
+        spread_inputQ[0].enq(truncate(rd));
+        spread_inputQ[1].enq(truncateLSB(rd));
     endrule
-
-    rule twoBitsEncoding;
-        Bit#(8) d <- serial_input.get;
-        case (d)
-            65: encodedDataQ.enq(0);
-            97: encodedDataQ.enq(0);
-            67: encodedDataQ.enq(1);
-            99: encodedDataQ.enq(1);
-            71: encodedDataQ.enq(2);
-            103: encodedDataQ.enq(2);
-            84: encodedDataQ.enq(3);
-            116: encodedDataQ.enq(3);
-        endcase
-    endrule
-
-    rule make32BitsKmerChunks;
-        encodedDataQ.deq;
-        Bit#(64) d = zeroExtend(encodedDataQ.first);
-        Bit#(64) kmer = kmer64bits;
-        kmer = kmer | d;
-        if (kmerCnt < 30) begin
-            kmerCnt <= kmerCnt + 1;
-        end else begin
-            kmerQ.enq(kmer);
-        end
-        kmer64bits <= kmer << 2;
-    endrule
-
-    rule distributeKmer;
-        kmerQ.deq;
-        toHashMultiQ.enq(kmerQ.first);
-    endrule
-
-    for (Bit#(8) i = 0; i < 4; i = i + 1) begin
-        rule hashing;
-            Bit#(64) kmer <- toHashMultiQ.get[i].get;
-            if (i == 0)
-                hashfuncQ[i].enq(kmer);
-        endrule
-    end
-
-    Bit#(32) query = 32'h00000001; // just for a test
-    for (Bit#(8) i = 0; i < 4; i = i + 1) begin
-        rule hashGet;
-            Bit#(64) d <- hashfuncQ[i].get;
-            Bit#(32) lower = truncate(d);
-            Bit#(32) upper = truncate(d >> 32);
-            Bit#(32) mask = 3;
-            if ((mask & upper) == query) begin
-                merge_st1Q[i].enq(lower);
-            end
-        endrule
-    end
 
     for (Bit#(3) i = 0; i < 2; i = i + 1) begin
-        rule merge_step1;
-            Bit#(3) id_one = i * 2;
-            Bit#(3) id_two = i * 2 + 1;
-            Bit#(64) d = 0;
-
-            if (merge_st1Q[id_one].notEmpty && merge_st1Q[id_two].notEmpty) begin
-                merge_st1Q[id_one].deq;
-                merge_st1Q[id_two].deq;
-                Bit#(64) d1 = zeroExtend(merge_st1Q[id_one].first);
-                Bit#(64) d2 = zeroExtend(merge_st1Q[id_two].first);
-                d1 = d1 << 32;
-                d = d1 | d2;
-                merge_st2Q[i].enq(d);
-            end else begin
-                if (merge_st1Q[id_one].notEmpty) begin
-                    merge_st1Q[id_one].deq;
-                    d = zeroExtend(merge_st1Q[id_one].first);
-                end else begin
-                    merge_st1Q[id_two].deq;
-                    d = zeroExtend(merge_st1Q[id_two].first);
-                end
-
-                if (merge_buf_1_ctl[i] == 1) begin // buf is not empty
-                    Bit#(64) buf_d = merge_buf_1[i];
-                    merge_st2Q[i].enq(d | buf_d);
-                    merge_buf_1[i] <= 0;
-                    merge_buf_1_ctl[i] <= 0;
-                end else begin
-                    merge_buf_1[i] <= (d << 32);
-                    merge_buf_1_ctl[i] <= 1;
-                end
-            end
+        rule distributeKmer;
+            spread_inputQ[i].deq;
+            toHashMultiQ[i].enq(spread_inputQ[i].first);
         endrule
     end
 
-    rule merge_step2;
-        Bit#(128) d = 0;
-
-        if (merge_st2Q[0].notEmpty && merge_st2Q[1].notEmpty) begin
-            merge_st2Q[0].deq;
-            merge_st2Q[1].deq;
-            Bit#(128) d1 = zeroExtend(merge_st2Q[0].first);
-            Bit#(128) d2 = zeroExtend(merge_st2Q[1].first);
-            d1 = d1 << 64;
-            d = d1 | d2;
-            hashedDataQ.enq(d);
-        end else begin
-            if (merge_st2Q[0].notEmpty) begin
-                merge_st2Q[0].deq;
-                d = zeroExtend(merge_st2Q[0].first);
-            end else begin
-                merge_st2Q[1].deq;
-                d = zeroExtend(merge_st2Q[1].first);
-            end
-
-            if (merge_buf_2_ctl == 1) begin // buf is not empty
-                hashedDataQ.enq(d | merge_buf_2);
-                merge_buf_2 <= 0;
-                merge_buf_2_ctl <= 0;
-            end else begin
-                merge_buf_2 <= (d << 64);
-                merge_buf_2_ctl <= 1;
-            end
+    for (Bit#(8) i = 0; i < 2; i = i + 1) begin
+        for (Bit#(8) j = 0; j < 8; j = j + 1) begin
+            rule hashing;
+                Bit#(64) kmer <- toHashMultiQ[i].get[j].get;
+                hashfuncQ[i][j].enq(kmer);
+            endrule
         end
-    endrule
+    end
 
-    rule toDram;
-        hashedDataQ.deq;
-        $display("%d ", hashedDataQ.first);
-        deserial_dram.put(hashedDataQ.first);
+    /* Merging */
+    for (Bit#(8) i = 0; i < 8; i = i + 1) begin
+        rule hashGet_merge_step_1;
+            Bit#(32) d1 <- hashfuncQ[0][i].get;
+            Bit#(32) d2 <- hashfuncQ[1][i].get;
+
+            Bit#(64) val = zeroExtend(d1);
+            val = val << 32;
+            val = val | zeroExtend(d2);
+            merge_st1Q[i].enq(val);
+        endrule
+    end
+    for (Bit#(8) i = 0; i < 4; i = i + 1) begin
+        rule hashGet_merge_step_2;
+            merge_st1Q[i * 2].deq;
+            merge_st1Q[i * 2 + 1].deq;
+            Bit#(128) d1 = zeroExtend(merge_st1Q[i * 2].first);
+            Bit#(128) d2 = zeroExtend(merge_st1Q[i * 2 + 1].first);
+            d2 = d2 << 64;
+
+            merge_st2Q[i].enq(d1 | d2);
+        endrule
+    end
+    for (Bit#(8) i = 0; i < 2; i = i + 1) begin
+        rule hashGet_merge_step_3;
+            merge_st2Q[i * 2].deq;
+            merge_st2Q[i * 2 + 1].deq;
+            Bit#(256) d1 = zeroExtend(merge_st2Q[i * 2].first);
+            Bit#(256) d2 = zeroExtend(merge_st2Q[i * 2 + 1].first);
+            d2 = d2 << 128;
+
+            merge_st3Q[i].enq(d1 | d2);
+        endrule
+    end
+    rule hashGet_merge_step_4;
+        merge_st3Q[0].deq;
+        merge_st3Q[1].deq;
+        Bit#(512) d1 = zeroExtend(merge_st3Q[0].first);
+        Bit#(512) d2 = zeroExtend(merge_st3Q[1].first);
+        d2 = d2 << 256;
+
+        toDramQ.enq(d1 | d2);
     endrule
 
     /* Write to DRAM */
     rule dramWrite(dramWriteCnt < file_size - 64); // have to fix it for not losing last 64bytes
         dramWriteCnt <= dramWriteCnt + 64;
-        Bit#(512) d <- deserial_dram.get;
+        toDramQ.deq;
+        Bit#(512) d = toDramQ.first;
+        $display("current : %d || target : ", dramWriteCnt, file_size);
+        $display("%b ", d);
         dram.write(zeroExtend(dramWriteCnt), d, 64);
     endrule
 
@@ -264,12 +217,22 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         end
     endrule
 
-    /* Giving DMA write done signal to the HOST */
-    rule sendResultToHost; 
+        /* Giving DMA write done signal to the HOST */
+    rule getSignalFromHost;
         let r <- pcie.dataReq;
         let a = r.addr;
         let offset = (a>>2);
-        if ( offset == 0 ) begin
+        if (offset == 0) begin
+            pcie_write_doneQ.enq(tuple2(r, 0));
+        end else begin
+            pcie_write_doneQ.enq(tuple2(r, 1));
+        end
+    endrule
+    rule sendDoneSignalToHost;
+        pcie_write_doneQ.deq;
+        let r = tpl_1(pcie_write_doneQ.first);
+        let offset = tpl_2(pcie_write_doneQ.first);
+        if (offset == 0) begin
             dramWriteDoneSignalQ.deq;
             pcie.dataSend(r, 1);
         end else begin
