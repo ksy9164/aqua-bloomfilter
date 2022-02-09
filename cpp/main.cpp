@@ -39,8 +39,9 @@ int main(int argc, char** argv) {
     for (int i = 0; i < comp_buff_size; ++i) { // transform file to compressed format
         int idx = i * 4;
         uint8_t val = 0;
+        int miss_panalty = 0;
         for (int j = 0; j < 4; j++) {
-            int key = idx + j;
+            int key = idx;
             char gene_char = gene_data[key];
 
             switch (gene_char) {
@@ -67,15 +68,15 @@ int main(int argc, char** argv) {
                 default :
                     cout << "inaccurate values" << val << endl;
                     miss_data++;
-                    j++;
             }
         }
         comp_gene_data[i] = val;
     }
+    cout << "number of missed data is " << miss_data << endl;
 
-    cout << "miss data is " << miss_data << endl;
+    /* STARTING NOW */
     /* Put size */
-    pcie->userWriteWord(0, comp_buff_size);
+    /* pcie->userWriteWord(0, comp_buff_size); */
 
     /* Write to DMA-Buffer and Send Signal */
     printf("Send data to the Host! \n");
