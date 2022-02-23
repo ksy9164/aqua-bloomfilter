@@ -17,13 +17,13 @@ import BloomNode::*;
 interface HwMainIfc;
 endinterface
 
-module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram) 
+module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     (HwMainIfc);
     Reg#(Bit#(32)) file_size <- mkReg(2550000);
     FIFOLI#(Tuple2#(Bit#(20), Bit#(32)), 2) pcie_reqQ <- mkFIFOLI;
 
     SerializerIfc#(128, 2) serial_dmaQ <- mkSerializer;
-    SerializerIfc#(256, 8) serial_to_radixQ <- mkSerializer;
+    SerializerIfc#(256, 2) serial_to_radixQ <- mkSerializer;
 
     FIFOLI#(Bit#(32), 2) dmaReadReqQ <- mkFIFOLI;
     FIFOLI#(Bit#(32), 2) dmaWriteReqQ <- mkFIFOLI;
@@ -49,7 +49,7 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     Vector#(4, FIFO#(Bit#(64))) merge_st1Q <- replicateM(mkFIFO);
     Vector#(2, FIFO#(Bit#(128))) merge_st2Q <- replicateM(mkFIFO);
 
-    BloomNodeIfc node <- mkBloomNode;
+    Vector#(4, BloomNodeIfc) node <- replicateM(mkBloomNode);
 
     rule getDataFromHost;
         let w <- pcie.dataReceive;
@@ -102,7 +102,7 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     end
 
     /* for (Bit#(8) i = 0; i < 4; i = i + 1) begin
-     *     rule hashGet_merge_step_1;
+     *     rule hashGet_merge_ste;
      *         Bit#(32) d1 <- hashfuncQ[i * 2].get;
      *         Bit#(32) d2 <- hashfuncQ[i * 2 + 1].get;
      *     endrule
@@ -113,9 +113,10 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         rule hashGet_merge_step_1;
             Bit#(32) d1 <- hashfuncQ[i * 2].get;
             Bit#(32) d2 <- hashfuncQ[i * 2 + 1].get;
-// test
-/*             if (i == 0) begin
- *                 if (temp_val % 2048 == 0) begin
+
+/*             // test
+ *             if (i == 0) begin
+ *                 if (temp_val % 8192 == 0) begin
  *                     temp_val <= temp_val + (1 << 16) + 1;
  *                     $display("good !!");
  *                 end else begin
@@ -153,9 +154,13 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         serial_to_radixQ.put(d1 | d2);
     endrule
 
-    // prepatcher - applyer start
+/////////////////////////// DRAM Arbiter part
 
-    Reg#(Bit#(1)) dram_req_handle <- mkReg(0);
+    Vector#(4, FIFO#(Bit#(32))) toNodeQ <- replicateM(mkFIFO);
+    Reg#(Bit#(32)) run_cnt <- mkReg(0); 
+
+    Reg#(Bit#(2)) dram_arbiter_handle <- mkReg(0);
+    Reg#(Bit#(2)) target_node <- mkReg(0);
 
     Reg#(Bit#(32)) dram_write_idx <- mkReg(0);
     Reg#(Bit#(32)) dram_write_cnt <- mkReg(128);
@@ -164,57 +169,74 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     Reg#(Bit#(32)) dram_read_put_cnt <- mkReg(128);
 
     Reg#(Bit#(32)) clock_cnt <- mkReg(0); 
-    Reg#(Bit#(32)) run_cnt <- mkReg(0); 
 
-    rule clock_rule;
-        clock_cnt <= clock_cnt + 1;
-    endrule
-
-    rule generate_bit_data;
-        Bit#(32) t <- serial_to_radixQ.get;
-        node.enq(t);
+    Reg#(Bit#(2)) rullet <- mkReg(0);
+///
+    rule get_Data_from_radix_sorter;
+        Bit#(128) t <- serial_to_radixQ.get;
+        toNodeQ[0].enq(t[127:96]);
+        toNodeQ[1].enq(t[95:64]);
+        toNodeQ[2].enq(t[63:32]);
+        toNodeQ[3].enq(t[31:0]);
         run_cnt <= run_cnt + 1;
     endrule
 
-    rule write_dram_req(dram_req_handle == 0 && dram_write_cnt == 128);
-        let t <- node.dram_write_req;
-        Bit#(32) d = zeroExtend(t);
-        dram_write_idx <= d * 1024 * 8;
-        dram_write_cnt <= 0;
+    for (Bit#(4) i = 0; i < 4; i = i + 1) begin
+        rule put_data_to_node;
+            toNodeQ[i].deq;
+            node[i].enq(toNodeQ[i].first);
+        endrule
+    end
+
+    rule rullet_rule;
+        rullet <= rullet + 1;
+        clock_cnt <= clock_cnt + 1;
+    endrule
+
+    rule get_dram_order(dram_arbiter_handle == 0);
+        let write_addr <- node[rullet].dram_write_req;
+        let read_addr <- node[rullet].dram_read_req;
+        Bit#(32) wd = zeroExtend(write_addr);
+        Bit#(32) rd = zeroExtend(read_addr);
 
         $display("clock %d , run %d ", clock_cnt, run_cnt);
+        dram_write_idx <= wd * 1024 * 8;
+        dram_read_idx <= rd * 1024 * 8;
+        dram_write_cnt <= 0;
+        dram_arbiter_handle <= 1;
+        target_node <= rullet;
     endrule
-    rule write_dram_data(dram_write_cnt < 128 && dram_req_handle == 0);
-        Bit#(512) d <- node.dram_write_data_get;
+    rule write_dram_data(dram_write_cnt < 128 && dram_arbiter_handle == 1);
+        Bit#(512) d <- node[target_node].dram_write_data_get;
         Bit#(32) idx = dram_write_idx + (dram_write_cnt * 64);
         dram.write(zeroExtend(idx), d , 64);
         dram_write_cnt <= dram_write_cnt + 1;
 
         if (dram_write_cnt == 127) begin
-            dram_req_handle <= 1;
+            dram_arbiter_handle <= 2;
+            $display("write_ dram_ done");
+            dram_read_cnt <= 0;
+            dram_read_put_cnt <= 0;
         end
     endrule
 
-    rule read_dram_req(dram_req_handle == 1 && dram_read_cnt == 128);
-        let t <- node.dram_read_req;
-        Bit#(32) d = zeroExtend(t);
-        dram_read_idx <= d * 1024 * 8;
-        dram_read_cnt <= 0;
-        dram_read_put_cnt <= 0;
-    endrule
-    rule read_dram_data(dram_req_handle == 1 && dram_read_cnt < 128);
+    rule read_dram_data(dram_arbiter_handle == 2 && dram_read_cnt < 128);
         Bit#(32) idx = dram_read_idx + (dram_read_cnt * 64);
         dram.readReq(zeroExtend(idx), 64);
         dram_read_cnt <= dram_read_cnt + 1;
     endrule
-    rule read_dram_put(dram_req_handle == 1 && dram_read_put_cnt < 128); // didnt hit
+    rule read_dram_put(dram_arbiter_handle == 2 && dram_read_put_cnt < 128); // didnt hit
         dram_read_put_cnt <= dram_read_put_cnt + 1;
         if (dram_read_put_cnt == 127) begin
-            dram_req_handle <= 0;
+            dram_arbiter_handle <= 0;
+            $display("read_ dram_ done");
         end
         Bit#(512) d <- dram.read;
-        node.dram_enq(d);
+        node[target_node].dram_enq(d);
     endrule
+
+////////////End of Arbiter //////////////////
+
 
     /* Giving DMA write done signal to the HOST */
     rule getSignalFromHost;
