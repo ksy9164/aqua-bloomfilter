@@ -18,6 +18,7 @@ interface BloomNodeIfc;
     method ActionValue#(Bit#(512)) dram_write_data_get;
 endinterface
 
+(* conflict_free = "read_from_bram, write_back_to_bram_req, merge_dram_write_data, read_data_from_DRAM" *)
 module mkBloomNode (BloomNodeIfc);
 
     FIFO#(Bit#(32)) inQ <- mkFIFO;
@@ -26,21 +27,31 @@ module mkBloomNode (BloomNodeIfc);
 
     Reg#(Bit#(1)) pre_handle <- mkReg(0);
     Reg#(Bit#(1)) app_handle <- mkReg(0);
-    Reg#(Bit#(1)) dram_read_handle <- mkReg(1);
     Reg#(Bit#(1)) dram_write_handle <- mkReg(1);
 
     FIFO#(Bit#(32)) toApplierQ <- mkSizedBRAMFIFO(2048);
+    FIFOLI#(Bit#(32), 2) pre_appQ <- mkFIFOLI;
+    FIFOLI#(Bit#(32), 2) post_appQ <- mkFIFOLI;
+
+    FIFOLI#(Bit#(128), 4) dram_readQ <- mkFIFOLI;
+    FIFOLI#(Bit#(128), 3) dram_writeQ <- mkFIFOLI;
+
+    /* FIFOLI#(Bit#(32), 4) toApplierQ <- mkFIFOLI;
+     * FIFOLI#(Bit#(128), 4) dram_readQ <- mkFIFOLI;
+     * FIFOLI#(Bit#(128), 4) dram_writeQ <- mkFIFOLI; */
 
     Reg#(Bit#(16)) prepat_cache <- mkReg(0);
     Reg#(Bit#(16)) app_cache <- mkReg(0);
 
     SerializerIfc#(512, 4) serial_dramQ <- mkSerializer;
-    FIFO#(Bit#(128)) dram_readQ <- mkSizedBRAMFIFO(512);
-    FIFO#(Bit#(128)) dram_writeQ <- mkSizedBRAMFIFO(512);
+
     Vector#(2, FIFO#(Bit#(32))) toBramQ <- replicateM(mkFIFO);
 
     Reg#(Bit#(2)) pre_first_flag <- mkReg(0);
     Reg#(Bit#(2)) app_first_flag <- mkReg(0);
+
+    FIFOLI#(Bit#(16), 2) next_read_dataQ <- mkFIFOLI;
+    FIFOLI#(Bit#(16), 2) applier_doneQ <- mkFIFOLI;
 
     Vector#(2, BramCtlIfc#(128, 512, 9)) bram_ctl <- replicateM(mkBramCtl);
     Vector#(2, Reg#(Bit#(2))) bram_ready <- replicateM(mkReg(1));
@@ -52,35 +63,42 @@ module mkBloomNode (BloomNodeIfc);
         
         // if first 16 bits are diff -> read from dram
         if (prepat_cache != upper) begin
-            $display("pre diff get");
             prepat_cache <= upper;
-            pre_handle <= pre_handle + 1;
 
             if (pre_first_flag == 2) begin // key point for this algorithm
-                dram_read_reqQ.enq(upper);
+                next_read_dataQ.enq(upper);
+                /* dram_read_reqQ.enq(upper); */
             end else begin
                 pre_first_flag <= pre_first_flag + 1;
             end
         end
 
-        toApplierQ.enq(d);
+        pre_appQ.enq(d);
     endrule
 
-    rule applier(bram_ready[app_handle] == 1);
+    rule bridge_app;
+        pre_appQ.deq;
+        toApplierQ.enq(pre_appQ.first);
+    endrule
+
+    rule bridge_app_post;
         toApplierQ.deq;
-        let d = toApplierQ.first;
+        post_appQ.enq(toApplierQ.first);
+    endrule
+
+    rule applier;
+        post_appQ.deq;
+        let d = post_appQ.first;
         Bit#(16) upper = truncateLSB(d);
         Bit#(1) handle = app_handle;
 
         if (app_cache != upper) begin
-            $display("app diff get");
             app_handle <= app_handle + 1;
             app_cache <= upper;
             handle = handle + 1;
 
             if (app_first_flag == 1) begin
-                bram_ready[app_handle] <= 0;
-                dram_write_reqQ.enq(app_cache);
+                applier_doneQ.enq(app_cache);
             end else begin
                 app_first_flag <= app_first_flag + 1;
             end
@@ -89,13 +107,7 @@ module mkBloomNode (BloomNodeIfc);
         toBramQ[handle].enq(d);
     endrule
 
-    Reg#(Bit#(10)) bram_read_req_cnt <- mkReg(0);
-    Reg#(Bit#(10)) bram_read_done_cnt <- mkReg(0);
-
-    Reg#(Bit#(10)) bram_write_req_cnt <- mkReg(0);
-    Reg#(Bit#(10)) bram_write_done_cnt <- mkReg(0);
-
-    Vector#(2, FIFO#(Bit#(16))) bram_dataQ <- replicateM(mkFIFO);
+    Vector#(2, FIFO#(Bit#(16))) bram_dataQ <- replicateM(mkSizedFIFO(4));
     for (Bit#(8) i = 0; i < 2; i = i + 1) begin
         rule read_from_bram(bram_ready[i] == 1); // read & write
             toBramQ[i].deq;
@@ -120,44 +132,62 @@ module mkBloomNode (BloomNodeIfc);
         endrule
     end
 
-    DeSerializerIfc#(128, 4) deserial_dram <- mkDeSerializer;
 
-    rule write_to_dram(bram_ready[dram_write_handle] == 0 && bram_read_req_cnt < 512); // write back to DRAM
-        Bit#(1) handle = dram_write_handle;
+    Reg#(Bit#(1)) bram_control_handle <- mkReg(1);
+    Reg#(Bit#(10)) bram_read_req_cnt <- mkReg(0);
+    Reg#(Bit#(10)) bram_read_done_cnt <- mkReg(0);
+
+    Reg#(Bit#(10)) bram_write_req_cnt <- mkReg(0);
+
+    DeSerializerIfc#(128, 4) deserial_dram <- mkDeSerializer;
+    FIFO#(Bit#(512)) dram_deserialQ <- mkFIFO;
+
+    rule check_bram_write_done(bram_ready[bram_control_handle] == 1);
+        next_read_dataQ.deq;
+        applier_doneQ.deq;
+
+        dram_write_reqQ.enq(applier_doneQ.first);
+        dram_read_reqQ.enq(next_read_dataQ.first);
+        bram_ready[bram_control_handle] <= 0;
+    endrule
+
+    // Write to DRAM
+    rule write_back_to_bram_req(bram_ready[bram_control_handle] == 0 && bram_read_req_cnt < 512);
+        Bit#(1) handle = bram_control_handle;
         bram_ctl[handle].read_req(truncate(bram_read_req_cnt));
         bram_read_req_cnt <= bram_read_req_cnt + 1;
     endrule
-    rule merge_dram_write_data(bram_ready[dram_write_handle] == 0);
-        Bit#(128) d <- bram_ctl[dram_write_handle].get;
+    rule merge_dram_write_data(bram_ready[bram_control_handle] == 0);
+        Bit#(128) d <- bram_ctl[bram_control_handle].get;
         if (bram_read_done_cnt == 511 && bram_read_req_cnt == 512) begin
-            dram_write_handle <= dram_write_handle + 1;
             bram_read_req_cnt <= 0;
             bram_read_done_cnt <= 0;
-            bram_ready[dram_write_handle] <= 2;
+            bram_ready[bram_control_handle] <= 2;
         end else begin
             bram_read_done_cnt <= bram_read_done_cnt + 1;
         end
         dram_writeQ.enq(d);
     endrule
-    
     rule out_dram;
         dram_writeQ.deq;
         deserial_dram.put(dram_writeQ.first);
     endrule
+    rule deserial_to_out;
+        Bit#(512) d <- deserial_dram.get;
+        dram_deserialQ.enq(d);
+    endrule
 
-    rule put_dram_read_to_bram(bram_ready[dram_read_handle] == 2 && bram_write_req_cnt < 512);
+    // Read from DRAM
+    rule read_data_from_DRAM(bram_ready[bram_control_handle] == 2 && bram_write_req_cnt < 512);
         dram_readQ.deq;
         Bit#(128) d = dram_readQ.first;
-
-        Bit#(1) handle = dram_read_handle;
+        Bit#(1) handle = bram_control_handle;
         bram_ctl[handle].write_req(truncate(bram_write_req_cnt), d);
-        $display("write to bram gogo ");
 
         if (bram_write_req_cnt == 511) begin // write to BRAM is done
-            $display("bram_write_!@# done?!");
             bram_write_req_cnt <= 0;
-            dram_read_handle <= dram_read_handle + 1;
-            bram_ready[dram_read_handle] <= 1;
+            bram_control_handle <= bram_control_handle + 1;
+            bram_ready[bram_control_handle] <= 1;
         end else begin
             bram_write_req_cnt <= bram_write_req_cnt + 1;
         end
@@ -179,8 +209,8 @@ module mkBloomNode (BloomNodeIfc);
         return dram_write_reqQ.first;
     endmethod
     method ActionValue#(Bit#(512)) dram_write_data_get;
-        Bit#(512) d <- deserial_dram.get;
-        return d;
+        dram_deserialQ.deq;
+        return dram_deserialQ.first;
     endmethod
     method ActionValue#(Bit#(16)) dram_read_req;
         dram_read_reqQ.deq;

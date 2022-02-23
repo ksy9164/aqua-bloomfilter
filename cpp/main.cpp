@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
     }
     printf("Data sending is done \n");
     fflush(stdout);
-    sleep(1);
+    sleep(100);
 
     ////////////////////////////data receiving////////////////////////////////////
     printf("Get data from the Host! \n");

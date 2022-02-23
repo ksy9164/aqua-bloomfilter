@@ -20,11 +20,8 @@ endinterface
 module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram) 
     (HwMainIfc);
     Reg#(Bit#(32)) file_size <- mkReg(2550000);
-    Reg#(Bit#(32)) dramWriteCnt <- mkReg(0);
-    Reg#(Bit#(32)) dramReadCnt <- mkReg(0);
-    FIFOLI#(Tuple2#(Bit#(20), Bit#(32)), 3) pcie_reqQ <- mkFIFOLI;
+    FIFOLI#(Tuple2#(Bit#(20), Bit#(32)), 2) pcie_reqQ <- mkFIFOLI;
 
-    DeSerializerIfc#(128, 4) deserial_dram <- mkDeSerializer;
     SerializerIfc#(128, 2) serial_dmaQ <- mkSerializer;
     SerializerIfc#(256, 8) serial_to_radixQ <- mkSerializer;
 
@@ -34,11 +31,7 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
 
     Reg#(Bit#(32)) readCnt <- mkReg(0);
 
-    FIFO#(Bit#(64)) kmerQ <- mkFIFO;
-    Reg#(Bit#(64)) kmer64bits <- mkReg(0);
-    Reg#(Bit#(6)) kmerCnt <- mkReg(0);
-
-    FIFOLI#(Tuple2#(PcieCtrl::IOReadReq, Bit#(1)), 3) pcie_write_doneQ <- mkFIFOLI;
+    FIFOLI#(Tuple2#(PcieCtrl::IOReadReq, Bit#(1)), 2) pcie_write_doneQ <- mkFIFOLI;
     Vector#(8, BloomHashIfc) hashfuncQ <- replicateM(mkJsHash);
     MultiOneToEightIfc#(Bit#(64)) toHashMultiQ <- mkMultiOnetoEight;
 
@@ -55,15 +48,6 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
 
     Vector#(4, FIFO#(Bit#(64))) merge_st1Q <- replicateM(mkFIFO);
     Vector#(2, FIFO#(Bit#(128))) merge_st2Q <- replicateM(mkFIFO);
-    FIFO#(Bit#(512)) toDramQ <- mkFIFO;
-
-    Vector#(2, Reg#(Bit#(64))) merge_buf_1 <- replicateM(mkReg(0)); 
-    Vector#(2, Reg#(Bit#(1))) merge_buf_1_ctl <- replicateM(mkReg(0)); 
-
-    FIFO#(Bit#(128)) hashedDataQ <- mkFIFO;
-
-    Reg#(Bit#(128)) merge_buf_2 <- mkReg(0); 
-    Reg#(Bit#(1)) merge_buf_2_ctl <- mkReg(0); 
 
     BloomNodeIfc node <- mkBloomNode;
 
@@ -117,12 +101,19 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         endrule
     end
 
+    /* for (Bit#(8) i = 0; i < 4; i = i + 1) begin
+     *     rule hashGet_merge_step_1;
+     *         Bit#(32) d1 <- hashfuncQ[i * 2].get;
+     *         Bit#(32) d2 <- hashfuncQ[i * 2 + 1].get;
+     *     endrule
+     * end */
+
     /* Merging */
     for (Bit#(8) i = 0; i < 4; i = i + 1) begin
         rule hashGet_merge_step_1;
             Bit#(32) d1 <- hashfuncQ[i * 2].get;
             Bit#(32) d2 <- hashfuncQ[i * 2 + 1].get;
-
+// test
 /*             if (i == 0) begin
  *                 if (temp_val % 2048 == 0) begin
  *                     temp_val <= temp_val + (1 << 16) + 1;
@@ -132,8 +123,8 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
  *                 end
  *             end
  *
- *             d1 = temp_val;
- *             d2 = temp_val; */
+ *             Bit#(32) d1 = temp_val;
+ *             Bit#(32) d2 = temp_val; */
 
             Bit#(64) val = zeroExtend(d1);
             val = val << 32;
@@ -172,9 +163,17 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     Reg#(Bit#(32)) dram_read_cnt <- mkReg(128);
     Reg#(Bit#(32)) dram_read_put_cnt <- mkReg(128);
 
+    Reg#(Bit#(32)) clock_cnt <- mkReg(0); 
+    Reg#(Bit#(32)) run_cnt <- mkReg(0); 
+
+    rule clock_rule;
+        clock_cnt <= clock_cnt + 1;
+    endrule
+
     rule generate_bit_data;
         Bit#(32) t <- serial_to_radixQ.get;
         node.enq(t);
+        run_cnt <= run_cnt + 1;
     endrule
 
     rule write_dram_req(dram_req_handle == 0 && dram_write_cnt == 128);
@@ -182,17 +181,16 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         Bit#(32) d = zeroExtend(t);
         dram_write_idx <= d * 1024 * 8;
         dram_write_cnt <= 0;
-    endrule
 
+        $display("clock %d , run %d ", clock_cnt, run_cnt);
+    endrule
     rule write_dram_data(dram_write_cnt < 128 && dram_req_handle == 0);
         Bit#(512) d <- node.dram_write_data_get;
         Bit#(32) idx = dram_write_idx + (dram_write_cnt * 64);
         dram.write(zeroExtend(idx), d , 64);
-        $display("dram_write req");
         dram_write_cnt <= dram_write_cnt + 1;
 
         if (dram_write_cnt == 127) begin
-            $display("read to write!!");
             dram_req_handle <= 1;
         end
     endrule
@@ -204,19 +202,15 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         dram_read_cnt <= 0;
         dram_read_put_cnt <= 0;
     endrule
-
     rule read_dram_data(dram_req_handle == 1 && dram_read_cnt < 128);
         Bit#(32) idx = dram_read_idx + (dram_read_cnt * 64);
-        $display("dram_read req");
         dram.readReq(zeroExtend(idx), 64);
         dram_read_cnt <= dram_read_cnt + 1;
     endrule
-
-    rule read_dram_put(dram_req_handle == 1 && dram_read_put_cnt < 128);
+    rule read_dram_put(dram_req_handle == 1 && dram_read_put_cnt < 128); // didnt hit
         dram_read_put_cnt <= dram_read_put_cnt + 1;
         if (dram_read_put_cnt == 127) begin
             dram_req_handle <= 0;
-            $display("write to read!!");
         end
         Bit#(512) d <- dram.read;
         node.dram_enq(d);
