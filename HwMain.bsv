@@ -14,6 +14,8 @@ import MultiN::*;
 import BloomHash::*;
 import BloomNode::*;
 
+import BLRadix::*;
+
 interface HwMainIfc;
 endinterface
 
@@ -101,31 +103,11 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         endrule
     end
 
-    /* for (Bit#(8) i = 0; i < 4; i = i + 1) begin
-     *     rule hashGet_merge_ste;
-     *         Bit#(32) d1 <- hashfuncQ[i * 2].get;
-     *         Bit#(32) d2 <- hashfuncQ[i * 2 + 1].get;
-     *     endrule
-     * end */
-
     /* Merging */
     for (Bit#(8) i = 0; i < 4; i = i + 1) begin
         rule hashGet_merge_step_1;
             Bit#(32) d1 <- hashfuncQ[i * 2].get;
             Bit#(32) d2 <- hashfuncQ[i * 2 + 1].get;
-
-/*             // test
- *             if (i == 0) begin
- *                 if (temp_val % 8192 == 0) begin
- *                     temp_val <= temp_val + (1 << 16) + 1;
- *                     $display("good !!");
- *                 end else begin
- *                     temp_val <= temp_val + 1;
- *                 end
- *             end
- *
- *             Bit#(32) d1 = temp_val;
- *             Bit#(32) d2 = temp_val; */
 
             Bit#(64) val = zeroExtend(d1);
             val = val << 32;
@@ -153,8 +135,45 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         d2 = d2 << 128;
         serial_to_radixQ.put(d1 | d2);
     endrule
+//////////////// Sorting Part ///////////////////
 
-/////////////////////////// DRAM Arbiter part
+	BLRadixIfc#(10,3,4,Bit#(32),0,7) radixSub <- mkBLRadix;
+	Reg#(Bit#(32)) dataInputCounter <- mkReg(0);
+	FIFO#(Vector#(4, Bit#(32))) toUploader <- mkFIFO;
+
+	Integer dataCnt = 1024*512;
+
+	rule inputData(dataInputCounter<fromInteger(dataCnt));
+        Bit#(128) t <- serial_to_radixQ.get;
+		dataInputCounter <= dataInputCounter + 1;
+		Vector#(4,Bit#(32)) ind;
+		ind[0] = t[127:96];
+		ind[1] = t[95:64];
+		ind[2] = t[63:32];
+		ind[3] = t[31:0];
+		radixSub.enq(ind);
+
+		if ( dataInputCounter + 1 >= fromInteger(dataCnt) ) begin
+			radixSub.flush();
+		end
+	endrule
+
+	Reg#(Bit#(32)) burstTotal <- mkReg(0);
+	Reg#(Bit#(32)) startCycle <- mkReg(0);
+	rule flushBurstReady;
+		let d <- radixSub.burstReady;
+		burstTotal <= burstTotal + zeroExtend(d);
+	endrule
+
+	Reg#(Bit#(32)) dataOutputCounter <- mkReg(0);
+	rule readOutput;
+		Vector#(4,Bit#(32)) outd = radixSub.first;
+		radixSub.deq;
+		toUploader.enq(outd);
+		dataOutputCounter <= dataOutputCounter + 1;
+	endrule
+
+/////////////////////////// DRAM Arbiter part ////////////
 
     Vector#(4, FIFO#(Bit#(32))) toNodeQ <- replicateM(mkFIFO);
     Reg#(Bit#(32)) run_cnt <- mkReg(0); 
@@ -173,11 +192,12 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     Reg#(Bit#(2)) rullet <- mkReg(0);
 ///
     rule get_Data_from_radix_sorter;
-        Bit#(128) t <- serial_to_radixQ.get;
-        toNodeQ[0].enq(t[127:96]);
-        toNodeQ[1].enq(t[95:64]);
-        toNodeQ[2].enq(t[63:32]);
-        toNodeQ[3].enq(t[31:0]);
+        toUploader.deq;
+        Vector#(4, Bit#(32)) t = toUploader.first;
+        toNodeQ[0].enq(t[0]);
+        toNodeQ[1].enq(t[1]);
+        toNodeQ[2].enq(t[2]);
+        toNodeQ[3].enq(t[3]);
         run_cnt <= run_cnt + 1;
     endrule
 
