@@ -12,10 +12,10 @@ import Serializer::*;
 
 interface BloomNodeIfc;
     method Action enq(Bit#(32) d);
-    method Action dram_enq(Bit#(512) d);
+    method Action dram_enq(Bit#(128) d);
     method ActionValue#(Bit#(16)) dram_write_req;
     method ActionValue#(Bit#(16)) dram_read_req;
-    method ActionValue#(Bit#(512)) dram_write_data_get;
+    method ActionValue#(Bit#(128)) dram_write_data_get;
 endinterface
 
 (* conflict_free = "read_from_bram, write_back_to_bram_req, merge_dram_write_data, read_data_from_DRAM" *)
@@ -43,7 +43,7 @@ module mkBloomNode (BloomNodeIfc);
     Reg#(Bit#(16)) prepat_cache <- mkReg(0);
     Reg#(Bit#(16)) app_cache <- mkReg(0);
 
-    SerializerIfc#(512, 4) serial_dramQ <- mkSerializer;
+    /* SerializerIfc#(512, 4) serial_dramQ <- mkSerializer; */
 
     Vector#(2, FIFO#(Bit#(32))) toBramQ <- replicateM(mkFIFO);
 
@@ -168,14 +168,6 @@ module mkBloomNode (BloomNodeIfc);
         end
         dram_writeQ.enq(d);
     endrule
-    rule out_dram;
-        dram_writeQ.deq;
-        deserial_dram.put(dram_writeQ.first);
-    endrule
-    rule deserial_to_out;
-        Bit#(512) d <- deserial_dram.get;
-        dram_deserialQ.enq(d);
-    endrule
 
     // Read from DRAM
     rule read_data_from_DRAM(bram_ready[bram_control_handle] == 2 && bram_write_req_cnt < 512);
@@ -193,24 +185,19 @@ module mkBloomNode (BloomNodeIfc);
         end
     endrule
 
-    rule in_dram_read;
-        let d <- serial_dramQ.get;
-        dram_readQ.enq(d);
-    endrule
-
     method Action enq(Bit#(32) d);
         inQ.enq(d);
     endmethod
-    method Action dram_enq(Bit#(512) d);
-        serial_dramQ.put(d);
+    method Action dram_enq(Bit#(128) d);
+        dram_readQ.enq(d);
     endmethod
     method ActionValue#(Bit#(16)) dram_write_req;
         dram_write_reqQ.deq;
         return dram_write_reqQ.first;
     endmethod
-    method ActionValue#(Bit#(512)) dram_write_data_get;
-        dram_deserialQ.deq;
-        return dram_deserialQ.first;
+    method ActionValue#(Bit#(128)) dram_write_data_get;
+        dram_writeQ.deq;
+        return dram_writeQ.first;
     endmethod
     method ActionValue#(Bit#(16)) dram_read_req;
         dram_read_reqQ.deq;

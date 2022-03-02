@@ -3,14 +3,15 @@ package DRAMarbiter;
 import FIFO::*;
 import Vector::*;
 import DRAMController::*;
+import Serializer::*;
 
 
 interface GetIfc;
-    method ActionValue#(Bit#(512)) get;
+    method ActionValue#(Bit#(128)) get;
 endinterface
 
 interface PutIfc;
-    method Action put(Bit#(512) d);
+    method Action put(Bit#(128) d);
 endinterface
 
 interface DRAMarbiterlIfc#(numeric type rw_chunk_size, numeric type user_num);
@@ -48,9 +49,13 @@ Reg#(Bit#(32)) dram_read_req_cnt <- mkReg(0);
 Reg#(Bit#(32)) dram_write_cnt <- mkReg(0);
 
 Vector#(user_num, FIFO#(Tuple2#(Bit#(512), Bit#(3)))) temp_outQ <- replicateM(mkFIFO);
-Vector#(user_num, FIFO#(Bit#(512))) outQ <- replicateM(mkFIFO);
 
-Vector#(user_num, FIFO#(Bit#(512))) temp_inQ <- replicateM(mkFIFO);
+Vector#(user_num, SerializerIfc#(512, 4)) serial_outQ <- replicateM(mkSerializer);
+Vector#(user_num, DeSerializerIfc#(128, 4)) deserial_inQ <- replicateM(mkDeSerializer);
+
+/* Vector#(user_num, FIFO#(Bit#(512))) outQ <- replicateM(mkFIFO); */
+
+/* Vector#(user_num, FIFO#(Bit#(512))) temp_inQ <- replicateM(mkFIFO); */
 Vector#(user_num, FIFO#(Bit#(512))) t_writeQ <- replicateM(mkFIFO);
 FIFO#(Bit#(512)) writeQ <- mkFIFO;
 
@@ -79,7 +84,7 @@ rule readReqStart(dram_arbiter_handle == 1 && dram_read_req_cnt != target_cnt);
 endrule
 
 rule getReadData(dram_arbiter_handle == 1 && dram_read_cnt != target_cnt);
-        if (dram_read_cnt == target_cnt) begin
+        if (dram_read_cnt + 1 == target_cnt) begin
             dram_arbiter_handle <= 2;
         end
         Bit#(512) d <- dram.read;
@@ -87,7 +92,7 @@ rule getReadData(dram_arbiter_handle == 1 && dram_read_cnt != target_cnt);
         temp_outQ[0].enq(tuple2(d, target_id));
 endrule
 
-rule resetRun(dram_arbiter_handle == 3);
+rule resetRun(dram_arbiter_handle == 2);
     target_addr <= 0;
     target_cnt <= 0;
     target_id <= unpack(0);
@@ -107,7 +112,7 @@ for (Bit#(32) i = 0; i < fromInteger(valueOf(user_num)); i = i + 1) begin
         let d = temp_outQ[i].first;
         Bit#(32) t_id = zeroExtend(tpl_2(d));
         if (t_id == i) begin
-            outQ[i].enq(tpl_1(d));
+            serial_outQ[i].put(tpl_1(d));
         end else if( i < fromInteger(valueOf(user_num) - 1)) begin
             temp_outQ[i + 1].enq(d);
         end
@@ -116,14 +121,13 @@ end
 
 for (Integer i = 0; i < fromInteger(valueOf(user_num)); i = i + 1) begin
     rule read_input_relay(fromInteger(i) == pack(target_id) && dram_arbiter_handle == 3);
-        temp_inQ[i].deq;
-        let d = temp_inQ[i].first;
+        let d <- deserial_inQ[i].get;
         t_writeQ[i].enq(d);
     endrule    
 end
 
 for (Integer i = 0; i < fromInteger(valueOf(user_num)) ; i = i + 1) begin
-    rule read_input_relay(fromInteger(i) == pack(target_id) && dram_arbiter_handle == 3);
+    rule read_input_relay(dram_arbiter_handle == 3);
         t_writeQ[i].deq;
         let d = t_writeQ[i].first;
         if (i < fromInteger(valueOf(user_num)) - 1) begin
@@ -137,7 +141,7 @@ end
 rule write_dram_data(dram_write_cnt != target_cnt && dram_arbiter_handle == 3);
     writeQ.deq;
     Bit#(512) d = writeQ.first;
-    Bit#(32) idx = target_addr + (target_cnt * 64);
+    Bit#(32) idx = target_addr + (dram_write_cnt * 64);
     dram.write(zeroExtend(idx), d , 64);
     dram_write_cnt <= dram_write_cnt + 1;
 
@@ -151,17 +155,17 @@ Vector#(user_num, GetIfc) get_;
 
     for (Integer i = 0; i < valueOf(user_num); i = i + 1) begin
         get_[i] = interface GetIfc;
-            method ActionValue#(Bit#(512)) get;
-                outQ[i].deq;
-                return outQ[i].first;
+            method ActionValue#(Bit#(128)) get;
+                let d <- serial_outQ[i].get;
+                return d;
             endmethod
         endinterface;
     end
 
     for (Integer i = 0; i < valueOf(user_num); i = i + 1) begin
         put_[i] = interface PutIfc;
-            method Action put(Bit#(512) d);
-                temp_inQ[i].enq(d);
+            method Action put(Bit#(128) d);
+                deserial_inQ[i].put(d);
             endmethod
         endinterface;
     end

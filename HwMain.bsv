@@ -137,7 +137,7 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         serial_to_radixQ.put(d1 | d2);
     endrule
 //////////////// Sorting Part ///////////////////
-
+/*
 	BLRadixIfc#(10,3,4,Bit#(32),0,7) radixSub <- mkBLRadix;
 	Reg#(Bit#(32)) dataInputCounter <- mkReg(0);
 	FIFO#(Vector#(4, Bit#(32))) toUploader <- mkFIFO;
@@ -195,11 +195,27 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         toNodeQ[3].enq(t[3]);
         $display("After sorting %d %d %d %d ", t[0], t[1], t[2], t[3]);
         run_cnt <= run_cnt + 1;
+        $display("runcnt is %d ", run_cnt);
     endrule
+*/
 
+    /// for arbiter testing
+    Vector#(4, FIFO#(Bit#(32))) toNodeQ <- replicateM(mkFIFO);
+    Reg#(Bit#(32)) run_cnt <- mkReg(0); 
+    Reg#(Bit#(32)) clock_cnt <- mkReg(0); 
+    rule get_Data_from_radix_sorter;
+        Bit#(128) t <- serial_to_radixQ.get;
+        toNodeQ[0].enq(t[127:96]);
+        toNodeQ[1].enq(t[95:64]);
+        toNodeQ[2].enq(t[63:32]);
+        toNodeQ[3].enq(t[31:0]);
+        //run_cnt <= run_cnt + 1;
+        $display("runcnt is %d ", run_cnt);
+    endrule
 /////////////////////////// DRAM Arbiter part ////////////
 
     Reg#(Bit#(2)) rullet <- mkReg(0);
+    Reg#(Bit#(32)) req_counter <- mkReg(0);
 
     Reg#(Bit#(1)) req_merger <- mkReg(0);
     DRAMarbiterlIfc#(2048, 4) dramArbiter <- mkDRAMarbiter(dram);
@@ -215,12 +231,15 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
 
     rule rullet_rule;
         rullet <= rullet + 1;
-        clock_cnt <= clock_cnt + 1;
+        //clock_cnt <= clock_cnt + 1;
     endrule
 
     rule get_req;
         let write_addr <- node[rullet].dram_write_req;
         let read_addr <- node[rullet].dram_read_req;
+        //req_counter <= req_counter + 1;
+        $display("clock %d , run %d ", clock_cnt, run_cnt);
+        $display("req counting is %d ", req_counter);
 
         dram_reqQ[0].enq(tuple4(zeroExtend(write_addr), 1, 4, zeroExtend(rullet)));
         dram_reqQ[1].enq(tuple4(zeroExtend(read_addr), 0, 4, zeroExtend(rullet)));
@@ -229,11 +248,12 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     rule put_req;
         dram_reqQ[req_merger].deq;
         dramArbiter.req(dram_reqQ[req_merger].first);
+        req_merger <= req_merger + 1;
     endrule
 
     for (Bit#(4) i = 0; i < 4; i = i + 1) begin
         rule putDRAMdata;
-            Bit#(512) d <- node[i].dram_write_data_get;
+            let d <- node[i].dram_write_data_get;
             dramArbiter.put[i].put(d);
         endrule
 
