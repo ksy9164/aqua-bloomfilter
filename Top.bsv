@@ -1,15 +1,13 @@
-import Clocks::*;
-import DefaultValue::*;
-import FIFO::*;
-import Connectable::*;
+import Clocks :: *;
+import ClockImport::*;
+import DefaultValue :: *;
 
-/* import Xilinx::*; */
-import XilinxCells::*;
-
-// PCIe stuff
 import PcieImport :: *;
 import PcieCtrl :: *;
 import PcieCtrl_bsim :: *;
+
+import Clocks       :: *;
+import FIFO::*;
 
 // DRAM stuff
 import DDR3Sim::*;
@@ -39,9 +37,11 @@ module mkProjectTop #(
     Clock pcie_clk_buf = pcie.sys_clk_o;
     Reset pcie_rst_n_buf = pcie.sys_rst_n_o;
 
-    Clock sys_clk_200mhz <- mkClockIBUFDS(defaultValue, sys_clk_p, sys_clk_n);
-    Clock sys_clk_200mhz_buf <- mkClockBUFG(clocked_by sys_clk_200mhz);
-    Reset rst200 <- mkAsyncReset( 4, pcie_rst_n_buf, sys_clk_200mhz_buf);
+	ClockGenIfc clk_200mhz_import <- mkClockIBUFDSImport(sys_clk_p, sys_clk_n);
+	Clock sys_clk_200mhz = clk_200mhz_import.gen_clk;
+	ClockGenIfc sys_clk_200mhz_buf_import <- mkClockBUFGImport(clocked_by sys_clk_200mhz);
+	Clock sys_clk_200mhz_buf = sys_clk_200mhz_buf_import.gen_clk;
+	Reset rst200 <- mkAsyncReset( 4, pcie_rst_n, sys_clk_200mhz_buf);
 
     PcieCtrlIfc pcieCtrl <- mkPcieCtrl(pcie.user, clocked_by pcie.user_clk, reset_by pcie.user_reset);
 
