@@ -42,11 +42,12 @@ Reg#(Bit#(3)) dram_arbiter_handle <- mkReg(0);
 FIFO#(Bit#(512)) merged_inpiutQ <- mkFIFO;
 
 Reg#(Bit#(32)) target_addr <- mkReg(0);
-Reg#(Bit#(32)) target_cnt <- mkReg(0);
+
+Reg#(Bit#(16)) target_cnt <- mkReg(0);
 Reg#(Bit#(3)) target_id <- mkReg(0);
-Reg#(Bit#(32)) dram_read_cnt <- mkReg(0);
-Reg#(Bit#(32)) dram_read_req_cnt <- mkReg(0);
-Reg#(Bit#(32)) dram_write_cnt <- mkReg(0);
+Reg#(Bit#(16)) dram_read_cnt <- mkReg(0);
+Reg#(Bit#(16)) dram_read_req_cnt <- mkReg(0);
+Reg#(Bit#(16)) dram_write_cnt <- mkReg(0);
 
 Vector#(user_num, FIFO#(Tuple2#(Bit#(512), Bit#(3)))) temp_outQ <- replicateM(mkFIFO);
 
@@ -71,14 +72,15 @@ rule get_requset_from_user(dram_arbiter_handle == 0);
         dram_arbiter_handle <= 3; // write req
     end
     
-    Bit#(32) t_num = zeroExtend(tpl_3(d));
+    Bit#(16) t_num = zeroExtend(tpl_3(d));
     target_cnt <= fromInteger(valueOf(target_size)) * t_num;
 
     target_id <= tpl_4(d);
 endrule
 
 rule readReqStart(dram_arbiter_handle == 1 && dram_read_req_cnt != target_cnt);
-    Bit#(32) t_addr = target_addr + (dram_read_req_cnt * 64);
+    Bit#(32) cnt = zeroExtend(dram_read_req_cnt) * 64;
+    Bit#(32) t_addr = target_addr + cnt;
     dram.readReq(zeroExtend(t_addr), 64);
     dram_read_req_cnt <= dram_read_req_cnt + 1;
 endrule
@@ -106,11 +108,11 @@ rule resetTempValue(dram_arbiter_handle == 4);
     dram_write_cnt <= 0;
 endrule
 
-for (Bit#(32) i = 0; i < fromInteger(valueOf(user_num)); i = i + 1) begin
+for (Bit#(16) i = 0; i < fromInteger(valueOf(user_num)); i = i + 1) begin
     rule read_output_relay;
         temp_outQ[i].deq;
         let d = temp_outQ[i].first;
-        Bit#(32) t_id = zeroExtend(tpl_2(d));
+        Bit#(16) t_id = zeroExtend(tpl_2(d));
         if (t_id == i) begin
             serial_outQ[i].put(tpl_1(d));
         end else if( i < fromInteger(valueOf(user_num) - 1)) begin
@@ -141,7 +143,9 @@ end
 rule write_dram_data(dram_write_cnt != target_cnt && dram_arbiter_handle == 3);
     writeQ.deq;
     Bit#(512) d = writeQ.first;
-    Bit#(32) idx = target_addr + (dram_write_cnt * 64);
+    Bit#(32) cnt = zeroExtend(dram_write_cnt) * 64;
+
+    Bit#(32) idx = target_addr + cnt;
     dram.write(zeroExtend(idx), d , 64);
     dram_write_cnt <= dram_write_cnt + 1;
 
