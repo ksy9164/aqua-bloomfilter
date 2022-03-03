@@ -4,7 +4,7 @@ import FIFO::*;
 import Vector::*;
 import DRAMController::*;
 import Serializer::*;
-
+import FIFOLI::*;
 
 interface GetIfc;
     method ActionValue#(Bit#(128)) get;
@@ -38,12 +38,14 @@ module mkDRAMarbiter#(DRAMUserIfc dram)
 FIFO#(Tuple4#(Bit#(32), Bit#(1), Bit#(4), Bit#(3))) inQ <- mkFIFO;
 //ex) inQ.enq(tuple4(adress, read/write, how many chunks req, id)
 
-Reg#(Bit#(3)) dram_arbiter_handle <- mkReg(0);
+Reg#(Bit#(2)) dram_arbiter_handle <- mkReg(0);
 FIFO#(Bit#(512)) merged_inpiutQ <- mkFIFO;
 
-Reg#(Bit#(32)) target_addr <- mkReg(0);
+Reg#(Bit#(32)) target_read_addr <- mkReg(0);
+Reg#(Bit#(32)) target_write_addr <- mkReg(0);
 
-Reg#(Bit#(16)) target_cnt <- mkReg(0);
+Reg#(Bit#(16)) target_read_cnt <- mkReg(0);
+Reg#(Bit#(16)) target_write_cnt <- mkReg(0);
 Reg#(Bit#(3)) target_id <- mkReg(0);
 Reg#(Bit#(16)) dram_read_cnt <- mkReg(0);
 Reg#(Bit#(16)) dram_read_req_cnt <- mkReg(0);
@@ -58,12 +60,18 @@ Vector#(user_num, DeSerializerIfc#(128, 4)) deserial_inQ <- replicateM(mkDeSeria
 
 /* Vector#(user_num, FIFO#(Bit#(512))) temp_inQ <- replicateM(mkFIFO); */
 Vector#(user_num, FIFO#(Bit#(512))) t_writeQ <- replicateM(mkFIFO);
-FIFO#(Bit#(512)) writeQ <- mkFIFO;
+FIFOLI#(Bit#(512), 3) writeQ <- mkFIFOLI;
 
 rule get_requset_from_user(dram_arbiter_handle == 0);
     inQ.deq;
     let d = inQ.first;
-    target_addr <= tpl_1(d);
+    Bit#(16) t_num = zeroExtend(tpl_3(d));
+
+    target_read_addr <= tpl_1(d);
+    target_write_addr <= tpl_1(d);
+    target_read_cnt <= fromInteger(valueOf(target_size)) * t_num;
+    target_write_cnt <= fromInteger(valueOf(target_size)) * t_num;
+    target_id <= tpl_4(d);
 
     Bit#(2) handle = zeroExtend(tpl_2(d));
     if (handle == 0) begin 
@@ -71,41 +79,28 @@ rule get_requset_from_user(dram_arbiter_handle == 0);
     end else begin
         dram_arbiter_handle <= 3; // write req
     end
-    
-    Bit#(16) t_num = zeroExtend(tpl_3(d));
-    target_cnt <= fromInteger(valueOf(target_size)) * t_num;
-
-    target_id <= tpl_4(d);
 endrule
 
-rule readReqStart(dram_arbiter_handle == 1 && dram_read_req_cnt != target_cnt);
+FIFOLI#(Bit#(3), 3) target_read_idQ <- mkFIFOLI;
+rule readReqStart(dram_arbiter_handle == 1 && dram_read_req_cnt != target_read_cnt);
     Bit#(32) cnt = zeroExtend(dram_read_req_cnt) * 64;
-    Bit#(32) t_addr = target_addr + cnt;
+    Bit#(32) t_addr = target_read_addr + cnt;
     dram.readReq(zeroExtend(t_addr), 64);
-    dram_read_req_cnt <= dram_read_req_cnt + 1;
+
+    if (dram_read_req_cnt + 1 == target_read_cnt) begin
+        dram_read_req_cnt <= 0;
+        dram_arbiter_handle <= 0;
+    end else begin
+        dram_read_req_cnt <= dram_read_req_cnt + 1;
+    end
+    target_read_idQ.enq(target_id);
 endrule
 
-rule getReadData(dram_arbiter_handle == 1 && dram_read_cnt != target_cnt);
-        if (dram_read_cnt + 1 == target_cnt) begin
-            dram_arbiter_handle <= 2;
-        end
+rule getReadData;
         Bit#(512) d <- dram.read;
-        dram_read_cnt <= dram_read_cnt + 1;
-        temp_outQ[0].enq(tuple2(d, target_id));
-endrule
-
-rule resetRun(dram_arbiter_handle == 2);
-    target_addr <= 0;
-    target_cnt <= 0;
-    target_id <= unpack(0);
-    dram_arbiter_handle <= 4;
-endrule
-
-rule resetTempValue(dram_arbiter_handle == 4);
-    dram_arbiter_handle <= 0;
-    dram_read_cnt <= 0;
-    dram_read_req_cnt <= 0;
-    dram_write_cnt <= 0;
+        target_read_idQ.deq;
+        let t_id = target_read_idQ.first;
+        temp_outQ[0].enq(tuple2(d, t_id));
 endrule
 
 for (Bit#(16) i = 0; i < fromInteger(valueOf(user_num)); i = i + 1) begin
@@ -129,7 +124,7 @@ for (Integer i = 0; i < fromInteger(valueOf(user_num)); i = i + 1) begin
 end
 
 for (Integer i = 0; i < fromInteger(valueOf(user_num)) ; i = i + 1) begin
-    rule read_input_relay(dram_arbiter_handle == 3);
+    rule read_input_relay;
         t_writeQ[i].deq;
         let d = t_writeQ[i].first;
         if (i < fromInteger(valueOf(user_num)) - 1) begin
@@ -140,17 +135,19 @@ for (Integer i = 0; i < fromInteger(valueOf(user_num)) ; i = i + 1) begin
     endrule    
 end
 
-rule write_dram_data(dram_write_cnt != target_cnt && dram_arbiter_handle == 3);
+rule write_dram_data(dram_write_cnt != target_write_cnt && dram_arbiter_handle == 3);
     writeQ.deq;
     Bit#(512) d = writeQ.first;
     Bit#(32) cnt = zeroExtend(dram_write_cnt) * 64;
 
-    Bit#(32) idx = target_addr + cnt;
+    Bit#(32) idx = target_write_addr + cnt;
     dram.write(zeroExtend(idx), d , 64);
-    dram_write_cnt <= dram_write_cnt + 1;
 
-    if (dram_write_cnt == target_cnt - 1) begin
-        dram_arbiter_handle <= 2;
+    if (dram_write_cnt == target_write_cnt - 1) begin
+        dram_arbiter_handle <= 0;
+        dram_write_cnt <= 0;
+    end else begin
+        dram_write_cnt <= dram_write_cnt + 1;
     end
 endrule
 
