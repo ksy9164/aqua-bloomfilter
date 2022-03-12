@@ -15,7 +15,7 @@ interface PutIfc;
 endinterface
 
 interface DRAMarbiterlIfc#(numeric type rw_chunk_size, numeric type user_num);
-    method Action req(Tuple4#(Bit#(32), Bit#(1), Bit#(4), Bit#(3)) d); // addr, read/write, 
+    method Action req(Tuple4#(Bit#(32), Bit#(1), Bit#(16), Bit#(3)) d); // addr, read/write, 
     interface Vector#(user_num, GetIfc) get;
     interface Vector#(user_num, PutIfc) put;
 endinterface
@@ -35,7 +35,7 @@ module mkDRAMarbiter#(DRAMUserIfc dram)
         Add#(user_num, 1, a__)
     );
 
-FIFO#(Tuple4#(Bit#(32), Bit#(1), Bit#(4), Bit#(3))) inQ <- mkFIFO;
+FIFO#(Tuple4#(Bit#(32), Bit#(1), Bit#(16), Bit#(3))) inQ <- mkFIFO;
 //ex) inQ.enq(tuple4(adress, read/write, how many chunks req, id)
 
 Reg#(Bit#(2)) dram_arbiter_handle <- mkReg(0);
@@ -65,7 +65,7 @@ FIFOLI#(Bit#(512), 3) writeQ <- mkFIFOLI;
 rule get_requset_from_user(dram_arbiter_handle == 0);
     inQ.deq;
     let d = inQ.first;
-    Bit#(16) t_num = zeroExtend(tpl_3(d));
+    Bit#(16) t_num = tpl_3(d);
 
     target_read_addr <= tpl_1(d);
     target_write_addr <= tpl_1(d);
@@ -93,6 +93,7 @@ rule readReqStart(dram_arbiter_handle == 1 && dram_read_req_cnt != target_read_c
     end else begin
         dram_read_req_cnt <= dram_read_req_cnt + 1;
     end
+    $display(" Read %d Target %d ", dram_read_req_cnt, target_read_cnt);
     target_read_idQ.enq(target_id);
 endrule
 
@@ -173,7 +174,7 @@ Vector#(user_num, GetIfc) get_;
 
     interface get = get_;
     interface put = put_;
-method Action req(Tuple4#(Bit#(32), Bit#(1), Bit#(4), Bit#(3)) d);
+method Action req(Tuple4#(Bit#(32), Bit#(1), Bit#(16), Bit#(3)) d);
     inQ.enq(d);
 endmethod
 

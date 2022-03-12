@@ -47,6 +47,8 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     hashfuncQ[6] <- mkDekHash;
     hashfuncQ[7] <- mkRotatingHash;
 
+    DRAMarbiterlIfc#(2048, 5) dramArbiter <- mkDRAMarbiter(dram);
+
     Vector#(2, FIFOLI#(Bit#(64), 3)) spread_inputQ <- replicateM(mkFIFOLI);
 
     Vector#(4, FIFO#(Bit#(64))) merge_st1Q <- replicateM(mkFIFO);
@@ -137,88 +139,158 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         serial_to_radixQ.put(d1 | d2);
     endrule
 //////////////// Sorting Part ///////////////////
-/*
-	BLRadixIfc#(10,3,4,Bit#(32),0,7) radixSub <- mkBLRadix;
-	Reg#(Bit#(32)) dataInputCounter <- mkReg(0);
+
+	Reg#(Bit#(7)) dram_write_cnt <- mkReg(0);
+
+	BLRadixIfc#(8,3,4,Bit#(32),0,7) radixFirst <- mkBLRadix;
+	BLRadixIfc#(8,3,4,Bit#(32),7,7) radixSecond <- mkBLRadix;
+
+    FIFO#(Bit#(128)) save_firstOutQ <- mkSizedBRAMFIFO(2048);
 	FIFO#(Vector#(4, Bit#(32))) toUploader <- mkFIFO;
+	FIFO#(Bit#(7)) lsbQ <- mkFIFO;
+	FIFO#(Bit#(7)) dram_req_idxQ <- mkFIFO;
+	FIFO#(Bit#(7)) save_addressQ <- mkFIFO;
 
-	Integer dataCnt = 1024*512;
+    BramCtlIfc#(11, 128, 7) bram_ctl <- mkBramCtl;
+	FIFO#(Bit#(32)) dram_fullQ <- mkFIFO;
 
-	rule inputData(dataInputCounter<fromInteger(dataCnt));
+    FIFO#(Tuple4#(Bit#(32), Bit#(1), Bit#(16), Bit#(3))) radix_dram_reqQ <- mkFIFO;
+
+	Integer base_idx = 1024*1024*512;
+
+	rule inputData;
         Bit#(128) t <- serial_to_radixQ.get;
-		dataInputCounter <= dataInputCounter + 1;
 		Vector#(4,Bit#(32)) ind;
-		
-		for (Bit#(4) i = 0; i < 4; i = i + 1) begin
-		    ind[i] = (ind[i]) ^ (ind[3 - i]) * dataInputCounter;
-		end
-		ind[0] = t[127:96];
+        ind[0] = t[127:96];
 		ind[1] = t[95:64];
 		ind[2] = t[63:32];
-		ind[3] = t[31:0];
-        $display("Before sorting %d %d %d %d ", ind[0], ind[1], ind[2], ind[3]);
+        ind[3] = t[31:0];
+        /* $display("Before sorting %d %d %d %d ", ind[0], ind[1], ind[2], ind[3]); */
+        radixFirst.enq(ind);
+	endrule
 
-		radixSub.enq(ind);
+	rule get_data;
+	    radixFirst.deq;
+		Vector#(4,Bit#(32)) ind = radixFirst.first;
+		Bit#(128) t = 0;
+        t[127:96] = ind[0];
+		t[95:64] = ind[1];
+		t[63:32] = ind[2];
+        t[31:0] = ind[3];
 
-		if ( dataInputCounter + 1 >= fromInteger(dataCnt) ) begin
-		    $display("Burst!! ");
-			radixSub.flush();
-		end
+        if (dram_write_cnt == 0) begin
+            lsbQ.enq(truncate(t)); // to write req to DRAM (2KB each)
+        end
+        dram_write_cnt <= dram_write_cnt + 1;
+        save_firstOutQ.enq(t); // 8KB buffer for 2KB
 	endrule
 
 	Reg#(Bit#(32)) burstTotal <- mkReg(0);
+	Reg#(Bit#(32)) burstTotal_sec <- mkReg(0);
 	Reg#(Bit#(32)) startCycle <- mkReg(0);
 	rule flushBurstReady;
-		let d <- radixSub.burstReady;
+		let d <- radixFirst.burstReady;
 		burstTotal <= burstTotal + zeroExtend(d);
 	endrule
 
-	Reg#(Bit#(32)) dataOutputCounter <- mkReg(0);
-	rule readOutput;
-		Vector#(4,Bit#(32)) outd = radixSub.first;
-		radixSub.deq;
-		toUploader.enq(outd);
-		dataOutputCounter <= dataOutputCounter + 1;
+	rule flushBurstReady_second;
+		let d <- radixSecond.burstReady;
+		burstTotal_sec <= burstTotal_sec + zeroExtend(d);
 	endrule
 
+	rule req_DRAM_address;
+	    lsbQ.deq;
+	    let d = lsbQ.first;
+
+        bram_ctl.read_req(d); // to get DRAM current idx
+        save_addressQ.enq(d);
+	endrule
+
+	rule calculate_DRAM_address;
+        Bit#(11) t <- bram_ctl.get;
+        Bit#(32) d = zeroExtend(t);
+        save_addressQ.deq;
+        Bit#(7) idx = save_addressQ.first;
+
+        Bit#(32) base = fromInteger(base_idx) + (1024 * 1024 * 2 * zeroExtend(idx));
+
+        Bit#(32) target_addr = d * 2048 + base;
+
+        // flush to Second_sorter , barrier will be needed in future
+        if ((d + 1) % 4 == 0) begin 
+            $display("upload first-sorted data -> DRAM");
+            dram_fullQ.enq(base + (d - 3) * 2048);
+        end 
+
+        /*
+        else if (d == 2047) begin
+            dram_fullQ.enq(base + (1024 * 2048));
+        end
+        */
+
+        radix_dram_reqQ.enq(tuple4(target_addr , 1, 1, 4));
+        bram_ctl.write_req(idx, truncate(d + 1));
+	endrule
+
+    rule putToDRAMarbiter;
+        save_firstOutQ.deq;
+        let d = save_firstOutQ.first;
+
+        dramArbiter.put[4].put(d);
+    endrule
+
+    rule radix_dramFlush_req;
+        dram_fullQ.deq;
+        Bit#(32) target_addr = dram_fullQ.first;
+        radix_dram_reqQ.enq(tuple4(target_addr , 0, 4, 4));
+    endrule
+
+    rule radix_command;
+        radix_dram_reqQ.deq;
+        let d = radix_dram_reqQ.first;
+        
+        dramArbiter.req(d);
+    endrule
+
+    rule get_data_from_arbiter_and_put_radix_second;
+        let d <- dramArbiter.get[4].get;
+		Vector#(4,Bit#(32)) ind;
+        ind[0] = d[127:96];
+		ind[1] = d[95:64];
+		ind[2] = d[63:32];
+        ind[3] = d[31:0];
+        $display("second in %d ", ind[0]);
+        radixSecond.enq(ind);
+    endrule
+
+    rule get_data_from_radix_second;
+        radixSecond.deq;
+        let d = radixSecond.first;
+        toUploader.enq(d);
+    endrule
 
     Vector#(4, FIFO#(Bit#(32))) toNodeQ <- replicateM(mkFIFO);
     Reg#(Bit#(32)) run_cnt <- mkReg(0); 
     Reg#(Bit#(32)) clock_cnt <- mkReg(0); 
 
-    rule get_Data_from_radix_sorter;
+    rule raidx_to_node_bridge;
         toUploader.deq;
         Vector#(4, Bit#(32)) t = toUploader.first;
         toNodeQ[0].enq(t[0]);
         toNodeQ[1].enq(t[1]);
         toNodeQ[2].enq(t[2]);
         toNodeQ[3].enq(t[3]);
-        $display("After sorting %d %d %d %d ", t[0], t[1], t[2], t[3]);
+        /* $display("After sorting %d %d %d %d ", t[0], t[1], t[2], t[3]); */
         run_cnt <= run_cnt + 1;
-        $display("runcnt is %d ", run_cnt);
+        /* $display("runcnt is %d ", run_cnt); */
     endrule
-*/
 
-    /// for arbiter testing
-    Vector#(4, FIFO#(Bit#(32))) toNodeQ <- replicateM(mkFIFO);
-    Reg#(Bit#(32)) run_cnt <- mkReg(0); 
-    Reg#(Bit#(32)) clock_cnt <- mkReg(0); 
-    rule get_Data_from_radix_sorter;
-        Bit#(128) t <- serial_to_radixQ.get;
-        toNodeQ[0].enq(t[127:96]);
-        toNodeQ[1].enq(t[95:64]);
-        toNodeQ[2].enq(t[63:32]);
-        toNodeQ[3].enq(t[31:0]);
-        //run_cnt <= run_cnt + 1;
-        $display("runcnt is %d ", run_cnt);
-    endrule
-/////////////////////////// DRAM Arbiter part ////////////
+/////////////////////////// Node uploader part ////////////
 
     Reg#(Bit#(2)) rullet <- mkReg(0);
     Reg#(Bit#(32)) req_counter <- mkReg(0);
 
     Reg#(Bit#(1)) req_merger <- mkReg(0);
-    DRAMarbiterlIfc#(2048, 4) dramArbiter <- mkDRAMarbiter(dram);
 
     for (Bit#(4) i = 0; i < 4; i = i + 1) begin
         rule put_data_to_node;
@@ -227,11 +299,11 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         endrule
     end
 
-    Vector#(2, FIFO#(Tuple4#(Bit#(32), Bit#(1), Bit#(4), Bit#(3)))) dram_reqQ <- replicateM(mkFIFO);
+    Vector#(2, FIFO#(Tuple4#(Bit#(32), Bit#(1), Bit#(16), Bit#(3)))) dram_reqQ <- replicateM(mkFIFO);
 
     rule rullet_rule;
         rullet <= rullet + 1;
-        //clock_cnt <= clock_cnt + 1;
+        clock_cnt <= clock_cnt + 1;
     endrule
 
     rule get_req;
