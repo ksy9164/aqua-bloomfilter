@@ -93,7 +93,6 @@ rule readReqStart(dram_arbiter_handle == 1 && dram_read_req_cnt != target_read_c
     end else begin
         dram_read_req_cnt <= dram_read_req_cnt + 1;
     end
-    $display(" Read %d Target %d ", dram_read_req_cnt, target_read_cnt);
     target_read_idQ.enq(target_id);
 endrule
 
