@@ -59,15 +59,18 @@ module mkBloomNode (BloomNodeIfc);
     rule prepatcher;
         inQ.deq;
         let d = inQ.first;
-        Bit#(16) upper = truncateLSB(d);
-        
-        // if first 16 bits are diff -> read from dram
-        if (prepat_cache != upper) begin
-            prepat_cache <= upper;
+        Bit#(16) d_lsb = truncate(d);
+        Bit#(2) id = truncateLSB(d_lsb);
 
+        // if first 16 bits are diff -> read from dram
+        if (prepat_cache != d_lsb) begin
+            prepat_cache <= d_lsb;
+            if (id == 0) begin
+                $display("pre %b , now %b, data : %b", prepat_cache, d_lsb, d);
+            end
             if (pre_first_flag == 2) begin // key point for this algorithm
-                next_read_dataQ.enq(upper);
-                /* dram_read_reqQ.enq(upper); */
+                next_read_dataQ.enq(d_lsb);
+                /* dram_read_reqQ.enq(d_lsb); */
             end else begin
                 pre_first_flag <= pre_first_flag + 1;
             end
@@ -89,12 +92,12 @@ module mkBloomNode (BloomNodeIfc);
     rule applier;
         post_appQ.deq;
         let d = post_appQ.first;
-        Bit#(16) upper = truncateLSB(d);
+        Bit#(16) d_lsb = truncate(d);
         Bit#(1) handle = app_handle;
 
-        if (app_cache != upper) begin
+        if (app_cache != d_lsb) begin
             app_handle <= app_handle + 1;
-            app_cache <= upper;
+            app_cache <= d_lsb;
             handle = handle + 1;
 
             if (app_first_flag == 1) begin
@@ -112,8 +115,8 @@ module mkBloomNode (BloomNodeIfc);
         rule read_from_bram(bram_ready[i] == 1); // read & write
             toBramQ[i].deq;
             Bit#(32) d = toBramQ[i].first;
-            Bit#(16) data = truncate(d);
-            Bit#(9) bram_idx = truncateLSB(data);
+            Bit#(16) data = truncateLSB(d);
+            Bit#(9) bram_idx = truncate(data);
 
             bram_ctl[i].read_req(bram_idx);
             bram_dataQ[i].enq(data);
@@ -124,8 +127,8 @@ module mkBloomNode (BloomNodeIfc);
             Bit#(128) d <- bram_ctl[i].get;
 
             Bit#(16) data = bram_dataQ[i].first;
-            Bit#(7)  bram_data = truncate(data);
-            Bit#(9)  bram_idx = truncateLSB(data);
+            Bit#(7)  bram_data = truncateLSB(data);
+            Bit#(9)  bram_idx = truncate(data);
 
             d[bram_data] = 1;
             bram_ctl[i].write_req(bram_idx, d);

@@ -7,7 +7,7 @@
 #include "bdbmpcie.h"
 
 /* #define FILE_NAME "./sample.txt" */
-#define FILE_NAME "/mnt/md0/sean/sample.txt"
+#define FILE_NAME "/mnt/md0/sean/kmer.txt"
 
 using namespace std;
 

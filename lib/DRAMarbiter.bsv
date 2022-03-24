@@ -6,12 +6,15 @@ import DRAMController::*;
 import Serializer::*;
 import FIFOLI::*;
 
+import BRAM::*;
+import BRAMFIFO::*;
+
 interface GetIfc;
-    method ActionValue#(Bit#(128)) get;
+    method ActionValue#(Bit#(512)) get;
 endinterface
 
 interface PutIfc;
-    method Action put(Bit#(128) d);
+    method Action put(Bit#(512) d);
 endinterface
 
 interface DRAMarbiterlIfc#(numeric type rw_chunk_size, numeric type user_num);
@@ -35,11 +38,10 @@ module mkDRAMarbiter#(DRAMUserIfc dram)
         Add#(user_num, 1, a__)
     );
 
-FIFO#(Tuple4#(Bit#(32), Bit#(1), Bit#(16), Bit#(3))) inQ <- mkFIFO;
+    FIFO#(Tuple4#(Bit#(32), Bit#(1), Bit#(16), Bit#(3))) inQ <- mkSizedBRAMFIFO(16);
 //ex) inQ.enq(tuple4(adress, read/write, how many chunks req, id)
 
 Reg#(Bit#(2)) dram_arbiter_handle <- mkReg(0);
-FIFO#(Bit#(512)) merged_inpiutQ <- mkFIFO;
 
 Reg#(Bit#(32)) target_read_addr <- mkReg(0);
 Reg#(Bit#(32)) target_write_addr <- mkReg(0);
@@ -50,8 +52,13 @@ Reg#(Bit#(3)) target_id <- mkReg(0);
 Reg#(Bit#(16)) dram_read_cnt <- mkReg(0);
 Reg#(Bit#(16)) dram_read_req_cnt <- mkReg(0);
 Reg#(Bit#(16)) dram_write_cnt <- mkReg(0);
+Reg#(Bit#(16)) dram_write_t_cnt <- mkReg(0);
 
-Vector#(user_num, FIFO#(Tuple2#(Bit#(512), Bit#(3)))) temp_outQ <- replicateM(mkFIFO);
+Reg#(Bit#(64)) clock_cnt <- mkReg(0);
+
+/* Vector#(user_num, FIFO#(Tuple2#(Bit#(512), Bit#(3)))) temp_outQ <- replicateM(mkFIFO); */
+Vector#(user_num, FIFO#(Tuple2#(Bit#(512), Bit#(3)))) temp_outQ <- replicateM(mkSizedBRAMFIFO(1024));
+Vector#(user_num, FIFO#(Bit#(512))) outQ <- replicateM(mkSizedBRAMFIFO(1024));
 
 Vector#(user_num, SerializerIfc#(512, 4)) serial_outQ <- replicateM(mkSerializer);
 Vector#(user_num, DeSerializerIfc#(128, 4)) deserial_inQ <- replicateM(mkDeSerializer);
@@ -60,7 +67,11 @@ Vector#(user_num, DeSerializerIfc#(128, 4)) deserial_inQ <- replicateM(mkDeSeria
 
 /* Vector#(user_num, FIFO#(Bit#(512))) temp_inQ <- replicateM(mkFIFO); */
 Vector#(user_num, FIFO#(Bit#(512))) t_writeQ <- replicateM(mkFIFO);
-FIFOLI#(Bit#(512), 3) writeQ <- mkFIFOLI;
+/* FIFOLI#(Bit#(512), 3) writeQ <- mkFIFOLI; */
+FIFO#(Bit#(512)) writeQ <- mkSizedBRAMFIFO(1024);
+rule clock_go;
+    clock_cnt <= clock_cnt + 1;
+endrule
 
 rule get_requset_from_user(dram_arbiter_handle == 0);
     inQ.deq;
@@ -81,11 +92,12 @@ rule get_requset_from_user(dram_arbiter_handle == 0);
     end
 endrule
 
-FIFOLI#(Bit#(3), 3) target_read_idQ <- mkFIFOLI;
+FIFO#(Bit#(3)) target_read_idQ <- mkSizedBRAMFIFO(64);
 rule readReqStart(dram_arbiter_handle == 1 && dram_read_req_cnt != target_read_cnt);
     Bit#(32) cnt = zeroExtend(dram_read_req_cnt) * 64;
     Bit#(32) t_addr = target_read_addr + cnt;
     dram.readReq(zeroExtend(t_addr), 64);
+    $display("read req clock %d ", clock_cnt);
 
     if (dram_read_req_cnt + 1 == target_read_cnt) begin
         dram_read_req_cnt <= 0;
@@ -98,6 +110,7 @@ endrule
 
 rule getReadData;
         Bit#(512) d <- dram.read;
+        $display("read done clock %d ", clock_cnt);
         target_read_idQ.deq;
         let t_id = target_read_idQ.first;
         temp_outQ[0].enq(tuple2(d, t_id));
@@ -109,29 +122,27 @@ for (Bit#(16) i = 0; i < fromInteger(valueOf(user_num)); i = i + 1) begin
         let d = temp_outQ[i].first;
         Bit#(16) t_id = zeroExtend(tpl_2(d));
         if (t_id == i) begin
-            serial_outQ[i].put(tpl_1(d));
+            outQ[i].enq(tpl_1(d));
         end else if( i < fromInteger(valueOf(user_num) - 1)) begin
             temp_outQ[i + 1].enq(d);
         end
     endrule
 end
 
-for (Integer i = 0; i < fromInteger(valueOf(user_num)); i = i + 1) begin
-    rule read_input_relay(fromInteger(i) == pack(target_id) && dram_arbiter_handle == 3);
-        let d <- deserial_inQ[i].get;
-        t_writeQ[i].enq(d);
-    endrule    
-end
+/* for (Integer i = 0; i < fromInteger(valueOf(user_num)); i = i + 1) begin
+ *     rule read_input_relay(fromInteger(i) == pack(target_id) && dram_arbiter_handle == 3);
+ *         let d <- deserial_inQ[i].get;
+ *         t_writeQ[i].enq(d);
+ *     endrule
+ * end */
 
 for (Integer i = 0; i < fromInteger(valueOf(user_num)) ; i = i + 1) begin
-    rule read_input_relay;
+    rule read_input_relay(fromInteger(i) == pack(target_id) && dram_arbiter_handle == 3 && dram_write_t_cnt != target_write_cnt);
+        dram_write_t_cnt <= dram_write_t_cnt + 1;
+        $display("write req clock %d ", clock_cnt);
         t_writeQ[i].deq;
         let d = t_writeQ[i].first;
-        if (i < fromInteger(valueOf(user_num)) - 1) begin
-            t_writeQ[i + 1].enq(d);
-        end else begin
-            writeQ.enq(d);
-        end
+        writeQ.enq(d);
     endrule    
 end
 
@@ -141,11 +152,13 @@ rule write_dram_data(dram_write_cnt != target_write_cnt && dram_arbiter_handle =
     Bit#(32) cnt = zeroExtend(dram_write_cnt) * 64;
 
     Bit#(32) idx = target_write_addr + cnt;
+    $display("write done clock %d ", clock_cnt);
     dram.write(zeroExtend(idx), d , 64);
 
-    if (dram_write_cnt == target_write_cnt - 1) begin
+    if (dram_write_cnt == target_write_cnt - 1 && dram_write_t_cnt == target_write_cnt) begin
         dram_arbiter_handle <= 0;
         dram_write_cnt <= 0;
+        dram_write_t_cnt <= 0;
     end else begin
         dram_write_cnt <= dram_write_cnt + 1;
     end
@@ -156,17 +169,19 @@ Vector#(user_num, GetIfc) get_;
 
     for (Integer i = 0; i < valueOf(user_num); i = i + 1) begin
         get_[i] = interface GetIfc;
-            method ActionValue#(Bit#(128)) get;
-                let d <- serial_outQ[i].get;
-                return d;
+            method ActionValue#(Bit#(512)) get;
+                outQ[i].deq;
+                return outQ[i].first;
+                /* let d <- serial_outQ[i].get;
+                 * return d; */
             endmethod
         endinterface;
     end
 
     for (Integer i = 0; i < valueOf(user_num); i = i + 1) begin
         put_[i] = interface PutIfc;
-            method Action put(Bit#(128) d);
-                deserial_inQ[i].put(d);
+            method Action put(Bit#(512) d);
+                t_writeQ[i].enq(d);
             endmethod
         endinterface;
     end

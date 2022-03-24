@@ -63,7 +63,7 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         let a = w.addr;
         let d = w.data;
         pcie_reqQ.enq(tuple2(a, d));
-        $display("clock %d , run %d ", clock_cnt, run_cnt);
+        $display("clock %d , run %d ratio %d", clock_cnt, run_cnt, (run_cnt * 1000) / clock_cnt * 4);
     endrule
 
     rule getPCIeData; // get from HOST
@@ -146,13 +146,16 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     Reg#(Bit#(7)) dram_write_cnt <- mkReg(0);
 
     BLRadixIfc#(8,3,4,Bit#(32),0,7) radixFirst <- mkBLRadix;
-    BLRadixIfc#(8,3,4,Bit#(32),7,7) radixSecond <- mkBLRadix;
+    BLRadixIfc#(10,3,4,Bit#(32),7,7) radixSecond <- mkBLRadix;
 
-    FIFO#(Bit#(128)) save_firstOutQ <- mkSizedBRAMFIFO(2048);
+    DeSerializerIfc#(128, 4) first_sort_desQ <- mkDeSerializer;
+    SerializerIfc#(512, 4) serial_secondsQ <- mkSerializer;
+
+    FIFO#(Bit#(512)) temp_save_to_firstOutQ <- mkSizedBRAMFIFO(1024);
     FIFO#(Vector#(4, Bit#(32))) toUploader <- mkSizedBRAMFIFO(4096);
-    FIFO#(Bit#(7)) lsbQ <- mkSizedFIFO(4);
-    FIFO#(Bit#(7)) dram_req_idxQ <- mkFIFO;
-    FIFO#(Bit#(7)) save_addressQ <- mkFIFO;
+    FIFO#(Bit#(7)) lsbQ <- mkSizedFIFO(21);
+    FIFO#(Bit#(7)) dram_req_idxQ <- mkSizedFIFO(11);
+    FIFO#(Bit#(7)) save_addressQ <- mkSizedFIFO(11);
 
     BramCtlIfc#(11, 128, 7) bram_ctl <- mkBramCtl;
 
@@ -177,6 +180,7 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         let d <- radixSecond.burstReady;
         burstTotal_sec <= burstTotal_sec + zeroExtend(d);
     endrule
+
     rule inputData;
         Bit#(128) t <- serial_to_radixQ.get;
         Vector#(4,Bit#(32)) ind;
@@ -184,7 +188,6 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         ind[1] = t[95:64];
         ind[2] = t[63:32];
         ind[3] = t[31:0];
-        /* $display("Before sorting %d %d %d %d ", ind[0], ind[1], ind[2], ind[3]); */
         run_cnt <= run_cnt + 1;
         start_cnt <= 1;
         radixFirst.enq(ind);
@@ -198,12 +201,18 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         t[95:64] = ind[1];
         t[63:32] = ind[2];
         t[31:0] = ind[3];
-
-        if (dram_write_cnt == 0) begin
+        if (dram_write_cnt == 127) begin
+            /* $display("Change!! "); */
             lsbQ.enq(truncate(t)); // to write req to DRAM (2KB each)
-        end
+        end  
         dram_write_cnt <= dram_write_cnt + 1;
-        save_firstOutQ.enq(t); // 8KB buffer for 2KB
+        first_sort_desQ.put(t);
+        /* temp_save_to_firstOutQ.enq(t); // 8KB buffer for 2KB */
+    endrule
+
+    rule get512andsave;
+        let d <- first_sort_desQ.get;
+        temp_save_to_firstOutQ.enq(d);
     endrule
 
     rule req_DRAM_address; // when 2KB comes
@@ -225,39 +234,31 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         Bit#(32) target_addr = d * 2048 + base;
 
         // flush to Second_sorter , barrier will be needed in future
-        /* if ((d + 1) % 4 == 0) begin 
-         *     $display("upload first-sorted data -> DRAM");
-         *     dram_fullQ.enq(base + (d - 3) * 2048);
-         * end  */
-
-        /* dram_fullQ.enq(base + d * 2048); */
-
         
-        if (d== 1023) begin
+        if (d== 1023) begin // first 2MB
             dram_fullQ.enq(base); // start with 0 idx
-        end else if (d == 2047) begin
+            $display("full req from %d", idx);
+        end else if (d == 2047) begin // last 2MB (4MB is total size)
             dram_fullQ.enq(base + 1024 * 2048); //2MB after
         end
         
-
         radix_dram_reqQ.enq(tuple4(target_addr , 1, 1, 4));
         bram_ctl.write_req(idx, truncate(d + 1));
     endrule
 
     rule putToDRAMarbiter;
-        save_firstOutQ.deq;
-        let d = save_firstOutQ.first;
+        temp_save_to_firstOutQ.deq;
+        let d = temp_save_to_firstOutQ.first;
 
         dramArbiter.put[4].put(d);
     endrule
 
     Reg#(Bit#(32)) sort_dram_r_req <- mkReg(0);
     Reg#(Bit#(32)) sort_dram_addr <- mkReg(0);
-    FIFO#(Bit#(128)) save_first_sortedQ <- mkSizedBRAMFIFO(1024);
+    FIFO#(Bit#(512)) save_first_sortedQ <- mkSizedBRAMFIFO(1024);
     Reg#(Bit#(32)) read_done_cnt <- mkReg(0);
-    Reg#(Bit#(7)) read_done_temp_cnt <- mkReg(0);
+    Reg#(Bit#(5)) read_done_temp_cnt <- mkReg(0);
     Reg#(Bit#(32)) read_req_cnt <- mkReg(0);
-    FIFO#(Bit#(1)) read_s_data_doneQ <- mkFIFO;
 
     rule radix_dramFlush_req(sort_dram_r_req == 0);
         dram_fullQ.deq;
@@ -266,10 +267,12 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         sort_dram_r_req <= 1024;
     endrule
 
-    rule dram_read_req_sorted_data(sort_dram_r_req != 0 && read_req_cnt - read_done_cnt < 3);
+(* descending_urgency = "calculate_DRAM_address, dram_read_req_sorted_data" *)
+    rule dram_read_req_sorted_data(sort_dram_r_req != 0 && read_req_cnt - read_done_cnt < 4);
+        /* $display("Second req!! target : %d current : %d ",sort_dram_r_req, read_req_cnt); */
         sort_dram_r_req <= sort_dram_r_req - 1;
         read_req_cnt <= read_req_cnt + 1;
-        radix_dram_reqQ.enq(tuple4(sort_dram_addr + 2048 * (sort_dram_r_req - 1), 0, 1, 4));
+        radix_dram_reqQ.enq(tuple4(sort_dram_addr + 2048 * (sort_dram_r_req - 1), 0, 1, 4)); //2KB read/write
     endrule
 
     rule radix_command;
@@ -282,6 +285,13 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     rule get_data_from_arbiter;
         let d <- dramArbiter.get[4].get; // 16B input
         save_first_sortedQ.enq(d);
+    endrule
+
+    rule put_radix_second_serial;
+        save_first_sortedQ.deq;
+        let d = save_first_sortedQ.first;
+        serial_secondsQ.put(d);
+
         read_done_temp_cnt <= read_done_temp_cnt + 1;
         if (read_done_temp_cnt == 0) begin // 2KB read starts
             read_done_cnt <= read_done_cnt + 1;
@@ -289,8 +299,7 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     endrule
 
     rule put_radix_second;
-        save_first_sortedQ.deq;
-        let d = save_first_sortedQ.first;
+        let d <- serial_secondsQ.get;
         Vector#(4,Bit#(32)) ind;
         ind[0] = d[127:96];
         ind[1] = d[95:64];
@@ -305,20 +314,50 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         toUploader.enq(d);
     endrule
 
-    Vector#(4, SerializerIfc#(128, 4)) serial_nodeQ <- replicateM(mkSerializer);
-    Vector#(4, FIFO#(Bit#(32))) toNodeQ <- replicateM(mkFIFO);
+    Vector#(4, FIFO#(Bit#(128))) to_semisorterQ <- replicateM(mkFIFO);
+    Vector#(4, FIFO#(Bit#(128))) toNodeQ <- replicateM(mkFIFO);
+    Vector#(4, Reg#(Bit#(128))) node_cache <- replicateM(mkReg(0));
     Reg#(Bit#(2)) node_rullet <- mkReg(0);
+
+    FIFO#(Bit#(128)) save_to_uploaderQ <- mkFIFO;
 
     rule raidx_to_node_bridge;
         toUploader.deq;
         Vector#(4, Bit#(32)) t = toUploader.first;
-        Bit#(128) d = {t[0],t[1],t[2],t[3]};
+        Bit#(128) d = 0;
         for (Bit#(4) i = 0; i < 4; i = i + 1) begin
-            serial_nodeQ[i].put(d);
+            d = d << 32;
+            d = d | zeroExtend(t[i]);
         end
-        /* $display("After sorting %d %d %d %d ", t[0], t[1], t[2], t[3]); */
-        /* $display("runcnt is %d ", run_cnt); */
+        
+        for (Bit#(4) i = 0; i < 4; i = i + 1) begin
+            to_semisorterQ[i].enq(d);
+        end
     endrule
+
+    for (Bit#(4) i = 0; i < 4; i = i + 1) begin
+        rule semi_sorting_rules;
+            to_semisorterQ[i].deq;
+            let d = to_semisorterQ[i].first;
+            Vector#(4,Bit#(32)) ind;
+            ind[0] = d[127:96];
+            ind[1] = d[95:64];
+            ind[2] = d[63:32];
+            ind[3] = d[31:0];
+            Bit#(128) r_data = 0 ;
+
+            for (Bit#(4) j = 0; j < 4; j = j + 1) begin
+                Bit#(2) id = 0;
+                Bit#(16) t = truncate(ind[i]);
+                id = truncateLSB(t);
+                if (id == truncate(i)) begin
+                    r_data = r_data << 32;
+                    r_data = r_data | zeroExtend(ind[i]);
+                end
+            end
+            toNodeQ[i].enq(r_data);
+        endrule
+    end
 
 /////////////////////////// Node uploader part ////////////
 
@@ -329,11 +368,27 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
 
     for (Bit#(4) i = 0; i < 4; i = i + 1) begin
         rule put_data_to_node;
-            let d <- serial_nodeQ[i].get;
-            Bit#(16) t_id = truncate(d);
-            Bit#(2) id = truncateLSB(t_id);
-            if (id == truncate(i)) begin
-                node[i].enq(d);
+            let c = node_cache[i];
+            let d = toNodeQ[i].first;
+
+            if (c != 0) begin
+                Bit#(32) data = truncate(c);
+                c = c >> 32;
+
+                node_cache[i] <= c;
+
+                data = data | 127;
+                node[i].enq(data);
+            end else begin
+                toNodeQ[i].deq;
+                Bit#(32) data = truncate(d);
+                if (data != 0) begin
+                    data = data | 127;
+                    node[i].enq(data);
+                    Bit#(128) temp = d;
+                    temp = temp >> 32;
+                    node_cache[i] <= temp;
+                end
             end
         endrule
     end
@@ -350,14 +405,17 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         let write_addr <- node[rullet].dram_write_req;
         let read_addr <- node[rullet].dram_read_req;
         //req_counter <= req_counter + 1;
-        $display("req counting is %d ", req_counter);
+        $display("req counting is %d ", rullet);
 
         dram_reqQ[0].enq(tuple4(zeroExtend(write_addr), 1, 4, zeroExtend(rullet)));
         dram_reqQ[1].enq(tuple4(zeroExtend(read_addr), 0, 4, zeroExtend(rullet)));
     endrule
 
-    Vector#(4, FIFO#(Bit#(128))) bloom_dram_outQ <- replicateM(mkSizedBRAMFIFO(128));
+    Vector#(4, FIFO#(Bit#(512))) bloom_dram_outQ <- replicateM(mkSizedBRAMFIFO(256));
+    Vector#(4, FIFO#(Bit#(512))) bloom_dram_inQ <- replicateM(mkSizedBRAMFIFO(256));
 
+    Vector#(4, DeSerializerIfc#(128, 4)) node_to_dram_writeQ <- replicateM(mkDeSerializer);
+    Vector#(4, SerializerIfc#(512, 4)) dram_to_node_readQ <- replicateM(mkSerializer);
 (* descending_urgency = "put_req, radix_command" *)
     rule put_req;
         dram_reqQ[req_merger].deq;
@@ -366,8 +424,13 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     endrule
 
     for (Bit#(4) i = 0; i < 4; i = i + 1) begin
-        rule putDRAMsavedata;
+        rule putDRAMsave_deserial;
             let d <- node[i].dram_write_data_get;
+            node_to_dram_writeQ[i].put(d);
+        endrule
+
+        rule putDRAMsavedata;
+            let d <- node_to_dram_writeQ[i].get;
             bloom_dram_outQ[i].enq(d);
         endrule
 
@@ -377,8 +440,19 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
             dramArbiter.put[i].put(d);
         endrule
 
-        rule getDRAMdata;
+        rule getDRAMdata_save;
             let d <- dramArbiter.get[i].get;
+            bloom_dram_inQ[i].enq(d);
+        endrule
+
+        rule getDRAMdata;
+            bloom_dram_inQ[i].deq;
+            let d = bloom_dram_inQ[i].first;
+            dram_to_node_readQ[i].put(d);
+        endrule
+
+        rule putDRAMdata_to_Node;
+            let d <- dram_to_node_readQ[i].get;
             node[i].dram_enq(d);
         endrule
     end
