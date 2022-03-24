@@ -97,7 +97,6 @@ rule readReqStart(dram_arbiter_handle == 1 && dram_read_req_cnt != target_read_c
     Bit#(32) cnt = zeroExtend(dram_read_req_cnt) * 64;
     Bit#(32) t_addr = target_read_addr + cnt;
     dram.readReq(zeroExtend(t_addr), 64);
-    $display("read req clock %d ", clock_cnt);
 
     if (dram_read_req_cnt + 1 == target_read_cnt) begin
         dram_read_req_cnt <= 0;
@@ -110,7 +109,6 @@ endrule
 
 rule getReadData;
         Bit#(512) d <- dram.read;
-        $display("read done clock %d ", clock_cnt);
         target_read_idQ.deq;
         let t_id = target_read_idQ.first;
         temp_outQ[0].enq(tuple2(d, t_id));
@@ -139,7 +137,6 @@ end
 for (Integer i = 0; i < fromInteger(valueOf(user_num)) ; i = i + 1) begin
     rule read_input_relay(fromInteger(i) == pack(target_id) && dram_arbiter_handle == 3 && dram_write_t_cnt != target_write_cnt);
         dram_write_t_cnt <= dram_write_t_cnt + 1;
-        $display("write req clock %d ", clock_cnt);
         t_writeQ[i].deq;
         let d = t_writeQ[i].first;
         writeQ.enq(d);
@@ -152,7 +149,6 @@ rule write_dram_data(dram_write_cnt != target_write_cnt && dram_arbiter_handle =
     Bit#(32) cnt = zeroExtend(dram_write_cnt) * 64;
 
     Bit#(32) idx = target_write_addr + cnt;
-    $display("write done clock %d ", clock_cnt);
     dram.write(zeroExtend(idx), d , 64);
 
     if (dram_write_cnt == target_write_cnt - 1 && dram_write_t_cnt == target_write_cnt) begin
