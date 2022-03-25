@@ -55,8 +55,8 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
     Vector#(2, FIFO#(Bit#(128))) merge_st2Q <- replicateM(mkFIFO);
 
     Vector#(2, BloomNodeIfc) node <- replicateM(mkBloomNode);
-    Reg#(Bit#(32)) clock_cnt <- mkReg(0); 
-    Reg#(Bit#(32)) run_cnt <- mkReg(0); 
+    Reg#(Bit#(64)) clock_cnt <- mkReg(0); 
+    Reg#(Bit#(64)) run_cnt <- mkReg(0); 
 
     rule getDataFromHost;
         let w <- pcie.dataReceive;
@@ -64,7 +64,7 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         let d = w.data;
         pcie_reqQ.enq(tuple2(a, d));
         if (clock_cnt != 0) begin
-            $display("clock %d , run %d ratio %d", clock_cnt, run_cnt, (run_cnt * 1000) / clock_cnt * 4);
+            $display("clock %d , run %d ratio %d", clock_cnt, run_cnt, ((run_cnt * 4000) / clock_cnt));
         end
     endrule
 
@@ -333,6 +333,7 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
         end
     endrule
 
+    Vector#(2, SerializerIfc#(128, 2)) serial_nodeQ <- replicateM(mkSerializer);
     for (Bit#(4) i = 0; i < 2; i = i + 1) begin
         rule semi_sorting_rules;
             to_semisorterQ[i].deq;
@@ -350,10 +351,12 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
                 id = truncateLSB(t);
                 if (id == truncate(i)) begin
                     r_data = r_data << 32;
-                    r_data = r_data | zeroExtend(ind[i]);
+                    r_data = r_data | zeroExtend(ind[i] | 255);
                 end
             end
-            toNodeQ[i].enq(r_data);
+            if (r_data != 0) begin
+                serial_nodeQ[i].put(r_data);
+            end
         endrule
     end
 
@@ -366,27 +369,9 @@ module mkHwMain#(PcieUserIfc pcie, DRAMUserIfc dram)
 
     for (Bit#(4) i = 0; i < 2; i = i + 1) begin
         rule put_data_to_node;
-            let c = node_cache[i];
-            let d = toNodeQ[i].first;
-
-            if (c != 0) begin
-                Bit#(32) data = truncate(c);
-                c = c >> 32;
-
-                node_cache[i] <= c;
-
-                data = data | 255;
-                node[i].enq(data);
-            end else begin
-                toNodeQ[i].deq;
-                Bit#(32) data = truncate(d);
-                if (data != 0) begin
-                    data = data | 255;
-                    node[i].enq(data);
-                    Bit#(128) temp = d;
-                    temp = temp >> 32;
-                    node_cache[i] <= temp;
-                end
+            let d <- serial_nodeQ[i].get;
+            if (d != 0) begin
+                node[i].enq(d);
             end
         endrule
     end
